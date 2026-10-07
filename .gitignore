@@ -1,0 +1,144 @@
+# Dependencies
+node_modules/
+web/node_modules/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+web/.env.local
+
+# Next.js
+.next/
+.next-e2e/
+out/
+build/
+dist/
+
+# Allow committed build output for the internal TypeScript SDK.
+!sdk/typescript/dist/
+!sdk/typescript/dist/**
+web/.next/
+web/.next-e2e/
+web/out/
+web/build/
+
+# Python
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg
+*.eggs/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+*.py[cod]
+*$py.class
+.Python
+
+# Database
+*.db
+*.sqlite3
+postgres-data/
+*.sql
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+pnpm-debug.log*
+logs/
+*.log.*
+
+# Runtime artifacts
+screenshots/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Testing
+coverage/
+.nyc_output/
+*.lcov
+playwright-report/
+test-results/
+web/playwright-report/
+web/test-results/
+web/tmp/
+
+# Misc
+.turbo/
+.vercel/
+.claude/
+.worktrees/
+.beads/
+!.beads/
+.beads/*
+!.beads/issues.jsonl
+*.tsbuildinfo
+.eslintcache
+.npm
+.yarn/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.cache/
+y/
+
+# Runtime data
+.memory_store.json
+data/memory_store.json
+third_party/research_refs/
+
+# Package manager locks (optional, remove if you want to commit them)
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+nul
+
+# Local runtime records are never part of the public repository.
+data/
+tools/data/memory_store.json
+learning/
+.pnpm-store/

@@ -1,0 +1,20 @@
+from typing import Any, Dict, List, Optional
+
+from langchain.tools import tool
+
+
+@tool
+def crawl4ai(urls: List[str], max_depth: int = 1, max_pages: int = 20) -> List[Dict[str, Any]]:
+    """
+    Crawl web pages using crawl4ai (if installed). Returns list of page dicts.
+    """
+    from crawl4ai import crawl
+
+    results = []
+    for url in urls:
+        try:
+            data = crawl(url, max_depth=max_depth, max_pages=max_pages)
+            results.append({"url": url, "data": data})
+        except Exception as e:
+            results.append({"url": url, "error": str(e)})
+    return results

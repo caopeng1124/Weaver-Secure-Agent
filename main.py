@@ -1,0 +1,6694 @@
+import asyncio
+import base64
+import hashlib
+import hmac
+import json
+import logging
+import re
+import threading
+import time
+import uuid
+from collections import OrderedDict
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    REGISTRY,
+    Counter,
+    Gauge,
+    generate_latest,
+)
+from pydantic import BaseModel, Field, field_validator
+from starlette.concurrency import run_in_threadpool
+
+from agent import (
+    AgentState,
+    ToolEvent,
+    create_checkpointer,
+    create_research_graph,
+    event_stream_generator,
+    get_deep_agent_prompt,
+    get_default_agent_prompt,
+    get_emitter,
+    initialize_enhanced_tools,
+    remove_emitter,
+)
+from agent.workflows.evidence_extractor import extract_message_sources
+from common.agents_store import (
+    AgentProfile,
+    ensure_default_agent,
+    load_agents,
+)
+from common.agents_store import (
+    delete_agent as delete_agent_profile,
+)
+from common.agents_store import (
+    get_agent as get_agent_profile,
+)
+from common.agents_store import (
+    upsert_agent as upsert_agent_profile,
+)
+from common.cancellation import TaskStatus, cancellation_manager
+from common.chat_stream_translate import translate_legacy_line_to_sse
+from common.config import settings
+from common.logger import get_logger, setup_logging
+from common.metrics import metrics_registry
+from common.proxy_env import normalize_socks_proxy_env
+from common.security.content import redact, redact_text
+from common.security.context import SecurityContext, current_context
+from common.security.runtime import untrusted
+from common.security.store import ApprovalError, SecurityStore
+from common.sse import (
+    format_sse_event,
+    format_sse_retry,
+    iter_abort_on_disconnect,
+    iter_with_sse_keepalive,
+)
+from common.thread_ownership import get_thread_owner, set_thread_owner
+from support_agent import create_support_graph
+from tools.browser.browser_session import browser_sessions
+from tools.core.memory_client import add_memory_entry, fetch_memories, store_interaction
+from tools.core.registry import set_registered_tools
+from tools.io.asr import get_asr_service, init_asr_service
+from tools.io.screenshot_service import get_screenshot_service
+from tools.io.tts import AVAILABLE_VOICES, get_tts_service, init_tts_service
+from tools.mcp import close_mcp_tools, init_mcp_tools, reload_mcp_tools
+from tools.sandbox import sandbox_browser_sessions
+from tools.search.multi_search import get_search_orchestrator
+from triggers import (
+    EventTrigger,
+    ScheduledTrigger,
+    TriggerStatus,
+    TriggerType,
+    WebhookTrigger,
+    get_trigger_manager,
+    init_trigger_manager,
+    shutdown_trigger_manager,
+)
+
+# Initialize logging
+setup_logging()
+logger = get_logger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await startup_event()
+    try:
+        yield
+    finally:
+        # Shutdown
+        await shutdown_event()
+
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Weaver Research Agent API",
+    description="Deep  research AI agent with code execution capabilities",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+APP_STARTED_AT = time.monotonic()
+
+
+# Prometheus metrics (optional, made idempotent to survive double imports under reload)
+def _get_or_create_counter(name: str, *args, **kwargs):
+    existing = REGISTRY._names_to_collectors.get(name)  # type: ignore[attr-defined]
+    if existing:
+        return existing
+    return Counter(name, *args, **kwargs)
+
+
+def _get_or_create_gauge(name: str, *args, **kwargs):
+    existing = REGISTRY._names_to_collectors.get(name)  # type: ignore[attr-defined]
+    if existing:
+        return existing
+    return Gauge(name, *args, **kwargs)
+
+
+http_requests_total = (
+    _get_or_create_counter(
+        "weaver_http_requests_total", "Total HTTP requests", ["method", "path", "status"]
+    )
+    if settings.enable_prometheus
+    else None
+)
+http_inprogress = (
+    _get_or_create_gauge("weaver_http_inprogress", "In-flight HTTP requests")
+    if settings.enable_prometheus
+    else None
+)
+
+# Streaming connection gauges (always registered; cheap + useful for debugging).
+sse_active_connections = _get_or_create_gauge(
+    "weaver_sse_active_connections",
+    "Active SSE connections",
+    ["endpoint"],
+)
+ws_active_connections = _get_or_create_gauge(
+    "weaver_ws_active_connections",
+    "Active WebSocket connections",
+    ["endpoint"],
+)
+
+# Browser stream metrics (useful even in local dev; low-cardinality labels only).
+browser_ws_frames_total = _get_or_create_counter(
+    "weaver_browser_ws_frames_total",
+    "Browser WS frames emitted (attempted)",
+    ["source"],
+)
+browser_ws_dropped_messages_total = _get_or_create_counter(
+    "weaver_browser_ws_dropped_messages_total",
+    "WS messages dropped due to send timeout/backpressure",
+    ["endpoint"],
+)
+
+
+# Request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all HTTP requests, enforce internal auth, and apply basic rate limiting."""
+    request_id = (request.headers.get("X-Request-ID") or "").strip() or str(uuid.uuid4())[:8]
+    start_time = time.time()
+    security_token = None
+
+    if http_inprogress:
+        http_inprogress.inc()
+
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    auth_user_header = (getattr(settings, "auth_user_header", "") or "").strip() or "X-Weaver-User"
+    path = request.url.path
+    method = request.method.upper()
+    rate_limit_enabled = bool(getattr(settings, "rate_limit_enabled_effective", True))
+
+    principal_id = ((request.headers.get(auth_user_header) or "").strip() if internal_key else "").strip()
+    request.state.principal_id = principal_id or ("internal" if internal_key else "anonymous")
+
+    logger.info(
+        f"Request started | {request.method} {request.url.path} | "
+        f"ID: {request_id} | Client: {request.client.host if request.client else 'unknown'}"
+    )
+
+    try:
+        should_auth = (
+            internal_key
+            and path.startswith("/api/")
+            and not path.startswith("/api/webhook/")
+            and method != "OPTIONS"
+        )
+        provided = ""
+        if should_auth:
+            auth_header = (request.headers.get("Authorization") or "").strip()
+            if auth_header.lower().startswith("bearer "):
+                provided = auth_header[7:].strip()
+            if not provided:
+                provided = (request.headers.get("X-API-Key") or "").strip()
+
+        authorized = (not should_auth) or (provided and hmac.compare_digest(provided, internal_key))
+
+        # Basic in-memory rate limiting (token bucket) with response headers.
+        rate_limit_limit = 0
+        rate_limit_remaining = 0
+        rate_limit_reset_ts = 0
+        rate_limit_exceeded = False
+        rate_limit_retry_after = 0
+        if rate_limit_enabled and path not in _RATE_LIMIT_EXEMPT and method != "OPTIONS":
+            identity = (
+                (getattr(request.state, "principal_id", "") or "").strip()
+                if internal_key and authorized
+                else _get_client_ip(request)
+            )
+            is_chat = path.startswith("/api/chat")
+            general_limit = int(getattr(settings, "rate_limit_general_per_minute", 60))
+            chat_limit = int(getattr(settings, "rate_limit_chat_per_minute", 20))
+            window_seconds = int(getattr(settings, "rate_limit_window_seconds", 60))
+            rate_limit_limit = chat_limit if is_chat else general_limit
+            bucket_key = f"{identity}:{'chat' if is_chat else 'general'}"
+            now = time.time()
+            max_buckets = int(getattr(settings, "rate_limit_max_buckets", 10_000) or 10_000)
+
+            bucket = _rate_limit_buckets.get(bucket_key)
+            if bucket is None or now - bucket["window_start"] >= window_seconds:
+                bucket = {"tokens": rate_limit_limit - 1, "window_start": now}
+                _rate_limit_buckets[bucket_key] = bucket
+            else:
+                bucket["tokens"] -= 1
+                try:
+                    _rate_limit_buckets.move_to_end(bucket_key)
+                except Exception:
+                    pass
+
+            # Cap memory usage under many unique clients.
+            try:
+                while len(_rate_limit_buckets) > max_buckets:
+                    _rate_limit_buckets.popitem(last=False)
+            except Exception:
+                pass
+
+            rate_limit_remaining = int(max(bucket.get("tokens", 0), 0))
+            rate_limit_reset_ts = int(bucket["window_start"] + window_seconds)
+
+            if bucket.get("tokens", 0) < 0:
+                rate_limit_exceeded = True
+                rate_limit_retry_after = int(window_seconds - (now - bucket["window_start"])) + 1
+
+        if rate_limit_exceeded:
+            response = JSONResponse(
+                status_code=429,
+                content={
+                    "detail": "Too many requests. Please slow down.",
+                    "retry_after": rate_limit_retry_after,
+                },
+                headers={"Retry-After": str(rate_limit_retry_after)},
+            )
+        elif not authorized:
+            response = JSONResponse(
+                status_code=401,
+                content={
+                    "error": "Unauthorized",
+                    "status_code": 401,
+                    "request_id": request_id,
+                    "timestamp": datetime.now().isoformat(),
+                },
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        elif settings.security_enabled and settings.app_env in {"prod", "production"} and not internal_key and path.startswith("/api/"):
+            response = JSONResponse(status_code=503, content={"detail": "Production security requires trusted API authentication"})
+        else:
+            security_token = current_context.set(SecurityContext(
+                principal=request.state.principal_id if internal_key else "local",
+                run_id=request_id,
+            ))
+            response = await call_next(request)
+
+        response.headers["X-Request-ID"] = request_id
+        if rate_limit_limit:
+            _apply_rate_limit_headers(
+                response,
+                limit=rate_limit_limit,
+                remaining=0 if rate_limit_exceeded else rate_limit_remaining,
+                reset_ts=rate_limit_reset_ts,
+            )
+        duration = time.time() - start_time
+
+        logger.info(
+            f"Request completed | {request.method} {request.url.path} | "
+            f"ID: {request_id} | Status: {response.status_code} | "
+            f"Duration: {duration:.3f}s"
+        )
+        if http_requests_total:
+            http_requests_total.labels(request.method, request.url.path, response.status_code).inc()
+
+        return response
+    except Exception as e:
+        duration = time.time() - start_time
+        logger.error(
+            f"? Request failed | {request.method} {request.url.path} | "
+            f"ID: {request_id} | Duration: {duration:.3f}s | Error: {str(e)}",
+            exc_info=True,
+        )
+        if http_requests_total:
+            http_requests_total.labels(request.method, request.url.path, 500).inc()
+        raise
+    finally:
+        if security_token is not None:
+            current_context.reset(security_token)
+        if http_inprogress:
+            http_inprogress.dec()
+
+
+# Configure CORS
+cors_origin_regex = None
+try:
+    env = (getattr(settings, "app_env", "") or "").strip().lower()
+    if bool(getattr(settings, "debug", False)) or env in {"dev", "debug", "local", "test"}:
+        # Dev ergonomics: allow the UI to run on any local port (e.g. 3100, 5173, random e2e ports).
+        cors_origin_regex = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+except Exception:
+    cors_origin_regex = None
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins_list,
+    allow_origin_regex=cors_origin_regex,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Thread-ID", "X-Request-ID"],  # Allow frontend to read these headers
+)
+
+
+# ---------------------------------------------------------------------------
+# Rate Limiting Middleware (in-memory token bucket)
+# ---------------------------------------------------------------------------
+_rate_limit_buckets: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_RATE_LIMIT_EXEMPT = {"/", "/health", "/metrics", "/docs", "/openapi.json", "/redoc"}
+_rate_limit_cleanup_task: asyncio.Task | None = None
+
+
+def _get_client_ip(request: Request) -> str:
+    """Extract client IP, respecting X-Forwarded-For behind a reverse proxy."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _apply_rate_limit_headers(response: Any, *, limit: int, remaining: int, reset_ts: int) -> None:
+    if not hasattr(response, "headers"):
+        return
+    response.headers["X-RateLimit-Limit"] = str(limit)
+    response.headers["X-RateLimit-Remaining"] = str(max(remaining, 0))
+    response.headers["X-RateLimit-Reset"] = str(reset_ts)
+
+
+def _require_thread_owner(request: Request, thread_id: str) -> None:
+    """
+    Enforce per-user thread isolation when internal auth is enabled.
+
+    Uses best-effort ownership sources:
+    - In-memory thread ownership registry (SSE-created threads)
+    - Persisted session state via checkpointer (if present)
+    """
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    if not internal_key:
+        return
+
+    principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+    if not principal_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    owner_id = (get_thread_owner(thread_id) or "").strip()
+    if owner_id and owner_id != principal_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not checkpointer:
+        return
+
+    try:
+        from common.session_manager import get_session_manager
+
+        manager = get_session_manager(checkpointer)
+        session_state = manager.get_session_state(thread_id)
+        if not session_state or not isinstance(session_state.state, dict):
+            return
+        persisted_owner = session_state.state.get("user_id")
+        if isinstance(persisted_owner, str) and persisted_owner.strip() and persisted_owner.strip() != principal_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    except HTTPException:
+        raise
+    except Exception:
+        # Authorization is best-effort; never 500 due to ownership lookups.
+        return
+
+
+# Periodic cleanup of stale rate-limit buckets (runs every 5 minutes)
+async def _cleanup_rate_limit_buckets():
+    try:
+        while True:
+            await asyncio.sleep(300)
+            now = time.time()
+            window_seconds = int(getattr(settings, "rate_limit_window_seconds", 60))
+            stale_keys = [
+                k for k, v in _rate_limit_buckets.items()
+                if now - v["window_start"] > window_seconds * 2
+            ]
+            for k in stale_keys:
+                _rate_limit_buckets.pop(k, None)
+    except asyncio.CancelledError:
+        return
+
+
+# Initialize agent graphs with short-term memory (checkpointer)
+if settings.database_url:
+    checkpointer = create_checkpointer(settings.database_url)
+else:
+    # Fallback to in-memory checkpointer for short-term memory
+    checkpointer = MemorySaver()
+
+
+def _init_store():
+    backend = settings.memory_store_backend.lower().strip()
+    url = settings.memory_store_url.strip()
+    if backend == "postgres":
+        if not url:
+            raise ValueError("memory_store_url is required when memory_store_backend=postgres")
+        from langgraph.store.postgres import PostgresStore
+
+        store_obj = PostgresStore.from_conn_string(url)
+        store_obj.setup()
+        logger.info("Initialized PostgresStore for long-term memory")
+        return store_obj
+    if backend == "redis":
+        if not url:
+            raise ValueError("memory_store_url is required when memory_store_backend=redis")
+        from langgraph.store.redis import RedisStore
+
+        store_obj = RedisStore.from_conn_string(url)
+        store_obj.setup()
+        logger.info("Initialized RedisStore for long-term memory")
+        return store_obj
+
+    logger.info("Using in-memory store (disabled persistent store)")
+    return None
+
+
+# Long-term memory store (configurable via .env)
+store = _init_store()
+
+research_graph = create_research_graph(
+    checkpointer=checkpointer,
+    interrupt_before=settings.interrupt_nodes_list,
+    store=store,
+)
+support_graph = create_support_graph(checkpointer=checkpointer, store=store)
+mcp_thread_id = "default"  # thread id for MCP event emission; per-request tools will override
+mcp_enabled = settings.enable_mcp
+mcp_servers_config = settings.mcp_servers
+mcp_loaded_tools = 0
+
+
+def _apply_mcp_thread_id(config: Any, thread_id: str) -> Any:
+    """
+    Ensure MCP server config carries a __thread_id__ hint for event emitters.
+
+    Accepts dict or JSON string and returns the same type with injected field.
+    """
+    if not thread_id:
+        return config
+
+    if isinstance(config, str):
+        try:
+            parsed = json.loads(config)
+        except json.JSONDecodeError:
+            return config
+        parsed["__thread_id__"] = thread_id
+        return parsed
+
+    if isinstance(config, dict):
+        updated = dict(config)
+        updated["__thread_id__"] = thread_id
+        return updated
+
+    return config
+
+
+async def startup_event():
+    """Initialize application on startup."""
+    logger.info("=" * 80)
+    logger.info("Weaver Research Agent Starting...")
+    logger.info("=" * 80)
+
+    # Normalize common proxy env quirks (e.g. `ALL_PROXY=socks://...`) so
+    # downstream httpx/OpenAI clients don't crash during request handling.
+    try:
+        normalize_socks_proxy_env()
+    except Exception as e:
+        logger.warning(f"Proxy env normalization failed: {e}")
+
+    # Ensure the rate-limit bucket cleanup task is running (lifespan-managed).
+    global _rate_limit_cleanup_task
+    if (
+        getattr(settings, "rate_limit_enabled_effective", False)
+        and (_rate_limit_cleanup_task is None or _rate_limit_cleanup_task.done())
+    ):
+        _rate_limit_cleanup_task = asyncio.create_task(
+            _cleanup_rate_limit_buckets(),
+            name="weaver-rate-limit-cleanup",
+        )
+
+    # Log configuration
+    logger.info(f"Environment: {'DEBUG' if settings.debug else 'PRODUCTION'}")
+    logger.info(f"Primary Model: {settings.primary_model}")
+    logger.info(f"Reasoning Model: {settings.reasoning_model}")
+    logger.info(f"Database: {'Configured' if settings.database_url else 'Not configured'}")
+    logger.info(f"Checkpointer: {'Enabled' if checkpointer else 'Disabled'}")
+
+    # Initialize MCP tools
+    global mcp_loaded_tools, mcp_servers_config
+    try:
+        logger.info("Initializing MCP tools...")
+        servers_cfg = _apply_mcp_thread_id(mcp_servers_config, mcp_thread_id)
+        mcp_servers_config = servers_cfg
+        mcp_tools = await init_mcp_tools(servers_override=servers_cfg, enabled=mcp_enabled)
+        if mcp_tools:
+            set_registered_tools(mcp_tools)
+            mcp_loaded_tools = len(mcp_tools)
+            logger.info(f"Successfully registered {mcp_loaded_tools} MCP tools")
+        else:
+            logger.info("No MCP tools to register")
+            mcp_loaded_tools = 0
+    except Exception as e:
+        logger.warning(f"MCP tools initialization failed: {e}", exc_info=settings.debug)
+        mcp_loaded_tools = 0
+
+    # Initialize enhanced tool system (Phase 1-4)
+    try:
+        logger.info("Initializing enhanced tool system (Phase 1-4)...")
+        initialize_enhanced_tools()
+        logger.info("Enhanced tool system initialized")
+    except Exception as e:
+        logger.warning(f"Enhanced tool system initialization failed: {e}", exc_info=settings.debug)
+
+    # Initialize ASR service
+    if settings.dashscope_api_key:
+        try:
+            logger.info("Initializing ASR service...")
+            init_asr_service(settings.dashscope_api_key)
+            logger.info("ASR service initialized")
+        except Exception as e:
+            logger.warning(f"ASR service initialization failed: {e}")
+    else:
+        logger.info("ASR service not configured (no DASHSCOPE_API_KEY)")
+
+    # Initialize TTS service
+    if settings.dashscope_api_key:
+        try:
+            logger.info("Initializing TTS service...")
+            init_tts_service(settings.dashscope_api_key)
+            logger.info("TTS service initialized")
+        except Exception as e:
+            logger.warning(f"TTS service initialization failed: {e}")
+    else:
+        logger.info("TTS service not configured (no DASHSCOPE_API_KEY)")
+
+    # Ensure local agents store exists (GPTs-like profiles)
+    try:
+        # Default agent: basic tools
+        ensure_default_agent(
+            default_profile=AgentProfile(
+                id="default",
+                name="Weaver Default Agent",
+                description="Default tool-using agent profile for agent mode.",
+                system_prompt=get_default_agent_prompt(),
+                enabled_tools={
+                    "web_search": True,
+                    "browser": True,
+                    "crawl": True,
+                    "python": True,
+                    "mcp": True,
+                },
+                metadata={"protected": True},
+            )
+        )
+
+        # Full-featured agent: all sandbox tools enabled (compat id: "manus")
+        ensure_default_agent(
+            default_profile=AgentProfile(
+                id="manus",
+                name="Weaver Full Agent",
+                description=(
+                    "Full-featured agent with all sandbox tools enabled. Supports file operations, "
+                    "shell commands, spreadsheets, presentations, image editing, and more."
+                ),
+                system_prompt=get_default_agent_prompt(),
+                enabled_tools={
+                    # Core tools
+                    "web_search": True,
+                    "crawl": True,
+                    "python": True,
+                    "mcp": True,
+                    "task_list": True,
+                    # Sandbox browser
+                    "sandbox_browser": True,
+                    "sandbox_web_search": True,
+                    # Sandbox file operations
+                    "sandbox_files": True,
+                    "sandbox_shell": True,
+                    # Web dev & deploy
+                    "sandbox_web_dev": True,
+                    # Document generation
+                    "sandbox_sheets": True,
+                    "sandbox_presentation": True,
+                    "presentation_outline": True,
+                    "presentation_v2": True,
+                    # Image processing
+                    "sandbox_vision": True,
+                    "sandbox_image_edit": True,
+                    # Desktop automation
+                    "computer_use": True,
+                },
+                metadata={"protected": True},
+            )
+        )
+        logger.info("Agents store initialized (data/agents.json)")
+    except Exception as e:
+        logger.warning(f"Agents store init failed: {e}", exc_info=settings.debug)
+
+    logger.info("=" * 80)
+    logger.info("Weaver Research Agent Ready")
+    logger.info("=" * 80)
+
+    # Initialize trigger system
+    try:
+        logger.info("Initializing trigger system...")
+        await init_trigger_manager()
+        logger.info("Trigger system initialized successfully")
+    except Exception as e:
+        logger.warning(f"Trigger system initialization failed: {e}", exc_info=settings.debug)
+
+
+async def shutdown_event():
+    """Cleanup on application shutdown."""
+    logger.info("=" * 80)
+    logger.info("Weaver Research Agent Shutting Down...")
+    logger.info("=" * 80)
+
+    # Stop lifespan-managed background tasks.
+    global _rate_limit_cleanup_task
+    cleanup_task = _rate_limit_cleanup_task
+    if cleanup_task and not cleanup_task.done():
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+    _rate_limit_cleanup_task = None
+
+    try:
+        logger.info("Closing MCP tools...")
+        await close_mcp_tools()
+        logger.info("MCP tools closed successfully")
+    except Exception as e:
+        logger.error(f"Error closing MCP tools: {e}", exc_info=True)
+
+    # Best-effort stop all Daytona sandboxes
+    try:
+        from tools.sandbox.daytona_client import daytona_stop_all
+
+        daytona_stop_all(thread_id=mcp_thread_id)
+    except Exception as e:
+        logger.warning(f"Error stopping Daytona sandboxes: {e}")
+
+    # Shutdown trigger system
+    try:
+        logger.info("Shutting down trigger system...")
+        await shutdown_trigger_manager()
+        logger.info("Trigger system shutdown successfully")
+    except Exception as e:
+        logger.error(f"Error shutting down trigger system: {e}", exc_info=True)
+
+    logger.info("=" * 80)
+    logger.info("Shutdown Complete")
+    logger.info("=" * 80)
+
+
+# Request/Response models
+class Message(BaseModel):
+    role: str
+    content: str
+
+    @field_validator("content")
+    @classmethod
+    def _protect_content(cls, value: str) -> str:
+        return redact_text(value)
+
+
+class SearchMode(BaseModel):
+    useWebSearch: bool = False
+    useAgent: bool = False
+    useDeepSearch: bool = False
+
+
+def _coerce_search_mode_input(value: Any) -> SearchMode | None:
+    """
+    Coerce legacy search_mode inputs into the structured SearchMode contract.
+
+    We keep the runtime tolerant (strings / dicts) while exposing a strict OpenAPI
+    schema (SearchMode object) for frontend/backend alignment.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, SearchMode):
+        return value
+
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"", "direct"}:
+            return SearchMode()
+        if lowered in {"web", "search", "tavily"}:
+            return SearchMode(useWebSearch=True)
+        if lowered in {"mcp"}:
+            # Frontend UX label: "MCP" is implemented as tool-calling agent mode.
+            return SearchMode(useAgent=True)
+        if lowered in {"agent"}:
+            return SearchMode(useAgent=True)
+        if lowered in {"deep", "deep_agent", "deep-agent", "ultra"}:
+            return SearchMode(useAgent=True, useDeepSearch=True)
+        # Unknown string → treat as direct.
+        return SearchMode()
+
+    if isinstance(value, dict):
+        use_web = bool(value.get("useWebSearch", value.get("use_web", False)))
+        use_agent = bool(value.get("useAgent", value.get("use_agent", False)))
+        use_deep = bool(value.get("useDeepSearch", value.get("use_deep", False)))
+
+        # If booleans were not provided but a mode string exists, derive flags from it.
+        if not (use_web or use_agent or use_deep) and isinstance(value.get("mode"), str):
+            mode_lower = value["mode"].strip().lower()
+            if mode_lower == "web":
+                use_web = True
+            elif mode_lower in {"agent", "deep"}:
+                use_agent = True
+                use_deep = mode_lower == "deep"
+
+        # Deep requires agent.
+        if use_deep and not use_agent:
+            use_deep = False
+
+        return SearchMode(useWebSearch=use_web, useAgent=use_agent, useDeepSearch=use_deep)
+
+    return None
+
+
+class ProviderCircuitSnapshot(BaseModel):
+    is_open: bool
+    consecutive_failures: int
+    opened_for_seconds: Optional[float] = None
+    resets_in_seconds: Optional[float] = None
+
+
+class SearchProviderSnapshot(BaseModel):
+    name: str
+    available: bool
+    healthy: bool
+    total_calls: int
+    success_count: int
+    error_count: int
+    success_rate: float
+    avg_latency_ms: float
+    avg_result_quality: float
+    last_error: Optional[str] = None
+    last_error_time: Optional[str] = None
+    circuit: ProviderCircuitSnapshot
+
+
+class SearchProvidersResponse(BaseModel):
+    providers: List[SearchProviderSnapshot]
+
+
+class SearchProvidersResetResponse(BaseModel):
+    reset: bool
+
+
+class ToolRegistryMostUsed(BaseModel):
+    name: str
+    call_count: int
+
+
+class ToolRegistryStats(BaseModel):
+    total_tools: int
+    enabled_tools: int
+    deprecated_tools: int
+    total_calls: int
+    total_successes: int
+    overall_success_rate: float
+    most_used: List[ToolRegistryMostUsed]
+    by_type: Dict[str, int]
+    tags: List[str]
+
+
+class ToolRegistryTool(BaseModel):
+    name: str
+    description: str = ""
+    tool_type: str = ""
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    return_type: Optional[str] = None
+    module_name: str = ""
+    class_name: str = ""
+    function_name: str = ""
+    version: str = "1.0.0"
+    tags: List[str] = Field(default_factory=list)
+    call_count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+    last_called: Optional[str] = None
+    average_duration_ms: float = 0.0
+    enabled: bool = True
+    deprecated: bool = False
+    deprecation_message: Optional[str] = None
+    success_rate: float = 0.0
+
+
+class ToolRegistryResponse(BaseModel):
+    stats: ToolRegistryStats
+    tools: List[ToolRegistryTool]
+
+
+class ToolRegistryRefreshResponse(BaseModel):
+    discovered: int
+    total_tools: int
+
+
+class AgentHealthResponse(BaseModel):
+    agents_count: int
+    agent_ids: List[str]
+    tool_registry_total_tools: int
+    enhanced_tool_discovery_enabled: bool
+    enhanced_tool_discovery_recursive: bool
+    rag_enabled: bool
+    search_strategy: str
+    search_engines: List[str]
+    search_providers_available: List[str]
+
+
+class PublicConfigDefaults(BaseModel):
+    port: int
+    primary_model: str
+    reasoning_model: str
+
+
+class PublicConfigFeatures(BaseModel):
+    mcp_enabled: bool
+    sandbox_mode: str
+    prometheus_enabled: bool
+    tracing_enabled: bool
+
+
+class PublicConfigStreamEndpoint(BaseModel):
+    protocol: str
+    endpoint: str
+
+
+class PublicConfigStreaming(BaseModel):
+    chat: PublicConfigStreamEndpoint
+    research: PublicConfigStreamEndpoint
+    events: PublicConfigStreamEndpoint
+    browser: PublicConfigStreamEndpoint
+
+
+class PublicConfigModels(BaseModel):
+    default: str
+    options: List[str]
+
+
+class PublicConfigResponse(BaseModel):
+    version: str
+    defaults: PublicConfigDefaults
+    features: PublicConfigFeatures
+    streaming: PublicConfigStreaming
+    models: PublicConfigModels
+
+
+class SandboxBrowserConfigured(BaseModel):
+    e2b_api_key: bool
+    sandbox_template_browser: bool
+    e2b_code_interpreter: bool
+    playwright: bool
+
+
+class SandboxBrowserDeepResult(BaseModel):
+    ok: bool
+    latency_ms: int
+    frame_bytes: Optional[int] = None
+    error: Optional[str] = None
+
+
+class SandboxBrowserDiagnoseResponse(BaseModel):
+    ready: bool
+    missing: List[str]
+    sandbox_mode: str
+    allow_internet: bool
+    configured: SandboxBrowserConfigured
+    deep: Optional[SandboxBrowserDeepResult] = None
+
+
+class SearchCacheStats(BaseModel):
+    size: int
+    max_size: int
+    hits: int
+    similar_hits: int
+    misses: int
+    hit_rate: float
+
+
+class SearchCacheStatsResponse(BaseModel):
+    stats: SearchCacheStats
+
+
+class SearchCacheClearResponse(BaseModel):
+    cleared: bool
+
+
+class ImagePayload(BaseModel):
+    name: Optional[str] = None
+    data: str
+    mime: Optional[str] = None
+
+
+class ChatRequest(BaseModel):
+    messages: List[Message]
+    stream: bool = True
+    model: Optional[str] = None
+    search_mode: Optional[SearchMode] = None
+    agent_id: Optional[str] = None  # optional GPTs-like agent profile id (data/agents.json)
+    user_id: Optional[str] = None
+    images: Optional[List[ImagePayload]] = None  # Base64 images for multimodal input
+
+    @field_validator("search_mode", mode="before")
+    @classmethod
+    def _coerce_search_mode(cls, value: Any) -> SearchMode | None:
+        return _coerce_search_mode_input(value)
+
+
+class ResearchRequest(BaseModel):
+    query: str
+    model: Optional[str] = None
+    search_mode: Optional[SearchMode] = None
+    agent_id: Optional[str] = None
+    user_id: Optional[str] = None
+    images: Optional[List[ImagePayload]] = None
+
+    @field_validator("query")
+    @classmethod
+    def _protect_query(cls, value: str) -> str:
+        return redact_text(value)
+
+    @field_validator("search_mode", mode="before")
+    @classmethod
+    def _coerce_search_mode(cls, value: Any) -> SearchMode | None:
+        return _coerce_search_mode_input(value)
+
+
+class ChatResponse(BaseModel):
+    id: str
+    content: str
+    role: str = "assistant"
+    timestamp: str
+
+    @field_validator("content")
+    @classmethod
+    def _protect_content(cls, value: str) -> str:
+        return redact_text(value)
+
+
+class GraphInterruptResumeRequest(BaseModel):
+    thread_id: str
+    payload: Any
+    model: Optional[str] = None
+    search_mode: Optional[SearchMode] = None
+    agent_id: Optional[str] = None
+
+    @field_validator("search_mode", mode="before")
+    @classmethod
+    def _coerce_search_mode(cls, value: Any) -> SearchMode | None:
+        return _coerce_search_mode_input(value)
+
+
+class MCPConfigPayload(BaseModel):
+    enable: Optional[bool] = None
+    servers: Optional[Dict[str, Any]] = None
+
+
+class AgentUpsertPayload(BaseModel):
+    id: Optional[str] = None
+    name: str
+    description: str = ""
+    system_prompt: str = ""
+    model: str = ""
+    enabled_tools: Dict[str, bool] = {}
+    mcp_servers: Optional[Dict[str, Any]] = None
+    metadata: Dict[str, Any] = {}
+
+
+class AgentsListResponse(BaseModel):
+    agents: List[AgentProfile]
+
+
+class SupportChatRequest(BaseModel):
+    message: str
+    user_id: Optional[str] = "default_user"
+    stream: bool = False  # reserved for future
+
+    @field_validator("message")
+    @classmethod
+    def _protect_message(cls, value: str) -> str:
+        return redact_text(value)
+
+
+class SupportChatResponse(BaseModel):
+    content: str
+    role: str = "assistant"
+    timestamp: str
+
+    @field_validator("content")
+    @classmethod
+    def _protect_content(cls, value: str) -> str:
+        return redact_text(value)
+
+
+class CancelRequest(BaseModel):
+    """鍙栨秷浠诲姟璇锋眰"""
+
+    reason: Optional[str] = "User requested cancellation"
+
+
+# Store active streaming tasks (legacy; cancellation is primarily token-based)
+active_streams: Dict[str, asyncio.Task] = {}
+
+# Track active browser live-view WS connections per thread_id.
+#
+# This is used to avoid tearing down sandbox browser sessions while the UI is
+# actively streaming frames. Cleanup is deferred until the viewer disconnects.
+_browser_stream_conn_lock = threading.Lock()
+_browser_stream_conn_counts: Dict[str, int] = {}
+
+
+def _browser_stream_conn_inc(thread_id: str) -> None:
+    tid = (thread_id or "").strip() or "default"
+    with _browser_stream_conn_lock:
+        _browser_stream_conn_counts[tid] = int(_browser_stream_conn_counts.get(tid, 0)) + 1
+
+
+def _browser_stream_conn_dec(thread_id: str) -> None:
+    tid = (thread_id or "").strip() or "default"
+    with _browser_stream_conn_lock:
+        current = int(_browser_stream_conn_counts.get(tid, 0))
+        next_val = max(0, current - 1)
+        if next_val <= 0:
+            _browser_stream_conn_counts.pop(tid, None)
+        else:
+            _browser_stream_conn_counts[tid] = next_val
+
+
+def _browser_stream_conn_active(thread_id: str) -> bool:
+    tid = (thread_id or "").strip() or "default"
+    with _browser_stream_conn_lock:
+        return int(_browser_stream_conn_counts.get(tid, 0)) > 0
+
+
+def _serialize_interrupts(interrupts: Any) -> List[Any]:
+    if not interrupts:
+        return []
+    result: List[Any] = []
+    for item in interrupts:
+        if hasattr(item, "value"):
+            result.append(item.value)
+        elif isinstance(item, dict):
+            result.append(item)
+        else:
+            result.append(str(item))
+    return result
+
+
+def _normalize_interrupt_resume_payload(payload: Any) -> Any:
+    """
+    Normalize /api/interrupt/resume payloads for LangGraph `interrupt()` resumes.
+
+    Weaver historically used a custom payload shape:
+        {"tool_approved": true/false, "tool_calls": [{name, args, ...}, ...]}
+
+    LangChain's official HumanInTheLoopMiddleware expects a HITLResponse:
+        {"decisions": [{"type": "approve"|"edit"|"reject", ...}, ...]}
+
+    This helper keeps backwards compatibility while allowing newer clients to
+    send the native HITLResponse shape directly.
+    """
+    if not isinstance(payload, dict):
+        return payload
+
+    # Native HITLResponse passthrough
+    decisions = payload.get("decisions")
+    if isinstance(decisions, list):
+        return payload
+
+    # Legacy tool approval payload -> HITLResponse decisions
+    if "tool_approved" in payload:
+        tool_calls = payload.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            raise ValueError(
+                "Legacy resume payload requires non-empty 'tool_calls' when 'tool_approved' is present"
+            )
+
+        approved = bool(payload.get("tool_approved"))
+        if approved:
+            normalized_decisions: List[Dict[str, Any]] = []
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    raise ValueError("tool_calls entries must be objects")
+                name = call.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError("tool_calls[].name is required")
+                args = call.get("args") or {}
+                if not isinstance(args, dict):
+                    args = {}
+                normalized_decisions.append(
+                    {
+                        "type": "edit",
+                        "edited_action": {"name": name, "args": args},
+                    }
+                )
+            return {"decisions": normalized_decisions}
+
+        message = payload.get("message")
+        if not isinstance(message, str) or not message.strip():
+            message = "User rejected tool execution."
+        return {
+            "decisions": [{"type": "reject", "message": message} for _ in tool_calls],
+        }
+
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Global Exception Handlers — consistent JSON error responses
+# ---------------------------------------------------------------------------
+from fastapi.exceptions import RequestValidationError
+from starlette.responses import JSONResponse as StarletteJSONResponse
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Return human-readable validation errors instead of raw Pydantic output."""
+    request_id = (request.headers.get("X-Request-ID") or "").strip() or str(uuid.uuid4())[:8]
+    errors = []
+    for err in exc.errors():
+        field = " → ".join(str(loc) for loc in err.get("loc", []))
+        errors.append({"field": field, "message": err.get("msg", ""), "type": err.get("type", "")})
+    logger.warning(f"Validation error | ID: {request_id} | Errors: {errors}")
+    return StarletteJSONResponse(
+        status_code=422,
+        content={
+            "error": "Validation Error",
+            "detail": errors,
+            "request_id": request_id,
+            "timestamp": datetime.now().isoformat(),
+        },
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Consistent JSON format for all HTTP exceptions."""
+    request_id = (request.headers.get("X-Request-ID") or "").strip() or str(uuid.uuid4())[:8]
+    return StarletteJSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail if isinstance(exc.detail, str) else "HTTP Error",
+            "status_code": exc.status_code,
+            "request_id": request_id,
+            "timestamp": datetime.now().isoformat(),
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Catch-all handler — never leak stack traces in production."""
+    request_id = (request.headers.get("X-Request-ID") or "").strip() or str(uuid.uuid4())[:8]
+    logger.error(
+        f"Unhandled exception | ID: {request_id} | {type(exc).__name__}: {exc}",
+        exc_info=True,
+    )
+    detail = str(exc) if settings.debug else "An internal server error occurred."
+    return StarletteJSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal Server Error",
+            "detail": detail,
+            "request_id": request_id,
+            "timestamp": datetime.now().isoformat(),
+        },
+    )
+
+
+@app.get("/")
+async def root():
+    """Health check endpoint."""
+    return {"status": "healthy", "service": "Weaver Research Agent", "version": "0.1.0"}
+
+
+@app.get("/health")
+async def health():
+    """Detailed health check."""
+    return {
+        "status": "healthy",
+        "database": "configured" if settings.database_url else "not configured",
+        "version": app.version,
+        "uptime_seconds": time.monotonic() - APP_STARTED_AT,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@app.get("/api/health/agent", response_model=AgentHealthResponse)
+async def agent_health():
+    """Lightweight agent subsystem health snapshot (no sandbox side effects)."""
+    from tools.core.registry import get_global_registry
+
+    profiles = load_agents()
+    agent_ids = []
+    try:
+        agent_ids = [str(p.id) for p in profiles if getattr(p, "id", None)]
+    except Exception:
+        agent_ids = []
+
+    registry = get_global_registry()
+
+    orchestrator = get_search_orchestrator()
+    try:
+        available = [p.name for p in orchestrator.get_available_providers()]
+    except Exception:
+        available = []
+
+    return {
+        "agents_count": len(profiles),
+        "agent_ids": sorted(agent_ids),
+        "tool_registry_total_tools": len(registry.list_names()),
+        "enhanced_tool_discovery_enabled": bool(getattr(settings, "enhanced_tool_discovery_enabled", True)),
+        "enhanced_tool_discovery_recursive": bool(
+            getattr(settings, "enhanced_tool_discovery_recursive", False)
+        ),
+        "rag_enabled": bool(getattr(settings, "rag_enabled", False)),
+        "search_strategy": str(getattr(settings, "search_strategy", "fallback") or "fallback"),
+        "search_engines": list(getattr(settings, "search_engines_list", [])),
+        "search_providers_available": sorted([str(n) for n in available if str(n).strip()]),
+    }
+
+
+# ==================== 鍙栨秷浠诲姟 API ====================
+
+
+@app.post("/api/chat/cancel/{thread_id}")
+async def cancel_chat(thread_id: str, request: Request, payload: CancelRequest | None = None):
+    """
+    鍙栨秷姝ｅ湪杩涜鐨勮亰澶╀换鍔?
+    Args:
+        thread_id: 浠诲姟绾跨▼ ID
+        request: 鍙€夌殑鍙栨秷鍘熷洜
+    """
+    _require_thread_owner(request, thread_id)
+
+    reason = payload.reason if payload else "User requested cancellation"
+    logger.info(f"Cancel request received for thread: {thread_id}, reason: {reason}")
+
+    # 1. 通过 cancellation_manager 取消令牌
+    cancelled = await cancellation_manager.cancel(thread_id, reason)
+
+    # 2. 取消对应的异步任务（如果存在）
+    if thread_id in active_streams:
+        task = active_streams[thread_id]
+        task.cancel()
+        del active_streams[thread_id]
+        logger.info(f"Async task for {thread_id} cancelled")
+
+    if cancelled:
+        return {
+            "status": "cancelled",
+            "thread_id": thread_id,
+            "reason": reason,
+            "timestamp": datetime.now().isoformat(),
+        }
+    else:
+        return {
+            "status": "not_found",
+            "thread_id": thread_id,
+            "message": "Task not found or already completed",
+        }
+
+
+def _task_is_visible_to_principal(task_id: str, task_info: Dict[str, Any], principal_id: str) -> bool:
+    owner_id = (get_thread_owner(task_id) or "").strip()
+    if owner_id:
+        return owner_id == principal_id
+    metadata = task_info.get("metadata", {})
+    if isinstance(metadata, dict):
+        meta_user_id = metadata.get("user_id")
+        if isinstance(meta_user_id, str) and meta_user_id.strip():
+            return meta_user_id.strip() == principal_id
+    return False
+
+
+@app.post("/api/chat/cancel-all")
+async def cancel_all_chats(request: Request):
+    """鍙栨秷鎵€鏈夋鍦ㄨ繘琛岀殑浠诲姟"""
+    logger.info("Cancel all tasks requested")
+
+    reason = "Batch cancellation requested"
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    if internal_key:
+        principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+
+        # Cancel only tasks belonging to this principal to avoid cross-user cancellation.
+        active = cancellation_manager.get_active_tasks()
+        owned_task_ids = [
+            task_id
+            for task_id, info in active.items()
+            if _task_is_visible_to_principal(task_id, info, principal_id)
+        ]
+        for task_id in owned_task_ids:
+            await cancellation_manager.cancel(task_id, reason)
+            task = active_streams.pop(task_id, None)
+            if task:
+                task.cancel()
+
+        cancelled_count = len(owned_task_ids)
+    else:
+        # 取消所有令牌
+        await cancellation_manager.cancel_all(reason)
+
+        # 取消所有异步任务
+        cancelled_count = len(active_streams)
+        for task in active_streams.values():
+            task.cancel()
+        active_streams.clear()
+
+    return {
+        "status": "all_cancelled",
+        "cancelled_count": cancelled_count,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@app.get("/api/tasks/active")
+async def get_active_tasks(request: Request):
+    """Get all active tasks."""
+    active_tasks = cancellation_manager.get_active_tasks()
+
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    if internal_key:
+        principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+        active_tasks = {
+            task_id: info
+            for task_id, info in active_tasks.items()
+            if _task_is_visible_to_principal(task_id, info, principal_id)
+        }
+
+        # Compute a user-scoped stats payload (avoid leaking global counts).
+        stats = {status.value: 0 for status in TaskStatus}
+        for info in active_tasks.values():
+            st = info.get("status")
+            if isinstance(st, str) and st in stats:
+                stats[st] += 1
+        stats["total"] = len(active_tasks)
+
+        stream_count = sum(
+            1
+            for thread_id in active_streams.keys()
+            if _task_is_visible_to_principal(
+                thread_id,
+                active_tasks.get(thread_id, {}),
+                principal_id,
+            )
+        )
+    else:
+        stats = cancellation_manager.get_stats()
+        stream_count = len(active_streams)
+
+    return {
+        "active_tasks": active_tasks,
+        "stats": stats,
+        "stream_count": stream_count,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+# ==================== 娴佸紡浜嬩欢鏍煎紡鍖?====================
+
+
+async def format_stream_event(event_type: str, data: Any) -> str:
+    """
+    Format events in Vercel AI SDK Data Stream Protocol format.
+
+    Format: {type}:{json_data}\n
+    """
+    payload = {"type": event_type, "data": redact(data)}
+    return f"0:{json.dumps(payload)}\n"
+
+
+def _should_emit_main_text_for_node(node_name: str) -> bool:
+    """
+    Decide whether streamed LLM tokens should be forwarded to the *main answer*
+    (the assistant bubble), based on which LangGraph node is currently running.
+
+    Goal: keep the main answer clean (OpenAI/DeepSeek-style) by preventing
+    planner/query-gen/decomposition nodes from leaking their intermediate output.
+    """
+    name = (node_name or "").strip().lower()
+    if not name:
+        return False
+
+    # Only allow "final writing" style nodes to stream tokens into the main answer.
+    # Everything else should be represented via status/process events.
+    allow_tokens = (
+        "writer",
+        "direct_answer",
+        "agent",
+        "reviser",
+    )
+    return any(token in name for token in allow_tokens)
+
+
+def _should_emit_thinking_summary_for_node(node_name: str) -> bool:
+    """
+    Decide whether a node's `output.messages` should be surfaced as a
+    human-readable "thinking summary" in the UI accordion.
+
+    This is NOT chain-of-thought. It is a short, user-facing progress narrative
+    (e.g. a research plan + queries), kept separate from the final answer.
+    """
+    name = (node_name or "").strip().lower()
+    if not name:
+        return False
+
+    # Only allow planning/clarification style nodes. Avoid writer/evaluator/deepsearch
+    # outputs which can be long or contain structured blobs that don't read well.
+    allow = (
+        "planner",
+        "web_plan",
+        "refine_plan",
+        "clarify",
+    )
+    return any(token in name for token in allow)
+
+
+def _looks_like_structured_blob(text: str) -> bool:
+    """
+    Heuristic guardrail: skip large JSON/python-like dumps from appearing in the
+    thinking accordion, which would recreate the "python list / json block" UX.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    if "```" in t:
+        return True
+    if t.startswith(("{", "[")) and len(t) > 40:
+        return True
+    # Common keys seen in deepsearch/planner structured dumps
+    if '"subtopics"' in t or "'subtopics'" in t or '"queries"' in t:
+        if "{" in t or "[" in t:
+            return True
+    return False
+
+
+def _sanitize_thinking_text(text: str, max_len: int = 1800) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if len(t) > max_len:
+        t = t[:max_len].rstrip() + "..."
+    return t
+
+
+def _contains_cjk(text: str) -> bool:
+    try:
+        return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+    except Exception:
+        return False
+
+
+def _thinking_intro_for_node(node_name: str, *, use_zh: bool) -> str:
+    name = (node_name or "").strip().lower()
+    if not name:
+        return ""
+
+    # Keep these as short, user-facing progress narratives (NOT chain-of-thought).
+    if "clarify" in name:
+        return "我先确认是否需要你补充信息，避免跑偏。" if use_zh else "I'll check if any clarification is needed so we don't go off-track."
+    if "planner" in name or "web_plan" in name or "refine_plan" in name:
+        return "我会先拆解问题并生成一组检索关键词。" if use_zh else "I'll break the question down and generate targeted search queries."
+    if "perform_parallel_search" in name or (("search" in name) and "research" not in name):
+        return "接下来我会检索并收集资料，多来源交叉验证。" if use_zh else "Next I'll search and collect sources, cross-checking across providers."
+    if "deepsearch" in name:
+        return (
+            "我会进行迭代式深度检索（生成查询 → 搜索 → 阅读 → 汇总），直到覆盖充分。"
+            if use_zh
+            else "I'll run an iterative deep-search loop (query → search → read → summarize) until coverage is solid."
+        )
+    if "compressor" in name:
+        return "我会去重并压缩信息，保留最相关证据。" if use_zh else "I'll deduplicate and compress sources, keeping the most relevant evidence."
+    if "writer" in name:
+        return "我会把证据整理成结构化的最终回答。" if use_zh else "I'll synthesize the evidence into a clear final answer."
+    if "evaluator" in name:
+        return "我会自检覆盖度/准确性，必要时补充检索或修订。" if use_zh else "I'll self-check coverage/accuracy and revise or research more if needed."
+    if "reviser" in name or "revise" in name:
+        return "我会根据自检结果修订答案，让表述更清晰。" if use_zh else "I'll revise the draft for clarity and completeness."
+    if name == "agent":
+        return "我会调用工具完成任务步骤，并记录关键过程。" if use_zh else "I'll call tools to execute steps and log key actions."
+
+    return ""
+
+
+def _compact_tool_args(tool_input: Any) -> Dict[str, Any]:
+    """
+    Best-effort compact tool args for streaming UI previews.
+
+    This must remain:
+    - small (avoid large blobs / file contents)
+    - safe (avoid leaking secrets; only include a small allowlist)
+    - JSON-serializable
+    """
+    if not isinstance(tool_input, dict):
+        return {}
+
+    allowed_keys = (
+        "query",
+        "url",
+        "code",
+        "path",
+        "command",
+        "args",
+        "selector",
+        "text",
+        "title",
+        "filename",
+    )
+    out: Dict[str, Any] = {}
+
+    for key in allowed_keys:
+        if key not in tool_input:
+            continue
+        value = tool_input.get(key)
+        if isinstance(value, str):
+            max_len = 400 if key == "code" else 200
+            trimmed = value.strip()
+            out[key] = trimmed if len(trimmed) <= max_len else trimmed[:max_len] + "..."
+            continue
+        if value is None or isinstance(value, (bool, int, float)):
+            out[key] = value
+            continue
+        if isinstance(value, list):
+            # Avoid dumping giant lists to the client.
+            out[key] = value[:10]
+            continue
+
+        # Fallback: stringify a small preview.
+        try:
+            out[key] = str(value)[:200]
+        except Exception:
+            pass
+
+    return out
+
+
+def _normalize_search_mode(search_mode: SearchMode | Dict[str, Any] | str | None) -> Dict[str, Any]:
+    if isinstance(search_mode, SearchMode):
+        use_web = search_mode.useWebSearch
+        use_agent = search_mode.useAgent
+        use_deep = search_mode.useDeepSearch
+        use_deep_prompt = use_deep
+    elif isinstance(search_mode, dict):
+        # Support both camelCase (frontend payload) and snake_case (already-normalized)
+        use_web = bool(search_mode.get("useWebSearch", search_mode.get("use_web", False)))
+        use_agent = bool(search_mode.get("useAgent", search_mode.get("use_agent", False)))
+        use_deep = bool(search_mode.get("useDeepSearch", search_mode.get("use_deep", False)))
+        use_deep_prompt = bool(
+            search_mode.get("useDeepPrompt", search_mode.get("use_deep_prompt", use_deep))
+        )
+
+        # If booleans were not provided but a mode string exists, derive flags from it
+        if not (use_web or use_agent or use_deep) and isinstance(search_mode.get("mode"), str):
+            mode_lower = search_mode["mode"].strip().lower()
+            if mode_lower == "web":
+                use_web = True
+            elif mode_lower in {"agent", "deep"}:
+                use_agent = True
+                use_deep = mode_lower == "deep"
+                use_deep_prompt = use_deep
+    elif isinstance(search_mode, str):
+        lowered = search_mode.lower().strip()
+
+        # UX labels
+        if lowered in {"direct", ""}:
+            use_web = False
+            use_agent = False
+            use_deep = False
+            use_deep_prompt = False
+        else:
+            use_web = lowered in {"web", "search", "tavily"}
+            use_agent = lowered in {"agent", "mcp", "deep", "deep_agent", "deep-agent", "ultra"}
+            use_deep = lowered in {"deep", "deep_agent", "deep-agent", "ultra"}
+            use_deep_prompt = use_deep
+    else:
+        use_web = False
+        use_agent = False
+        use_deep = False
+        use_deep_prompt = False
+
+    if use_deep and not use_agent:
+        use_deep = False
+        use_deep_prompt = False
+
+    if use_agent:
+        mode = "deep" if use_deep else "agent"
+    elif use_web:
+        mode = "web"
+    else:
+        mode = "direct"
+
+    return {
+        "use_web": use_web,
+        "use_agent": use_agent,
+        "use_deep": use_deep,
+        "mode": mode,
+        "use_deep_prompt": use_deep_prompt,
+    }
+
+
+def _normalize_images_payload(images: Optional[List[ImagePayload]]) -> List[Dict[str, Any]]:
+    """
+    Normalize incoming image payloads; strip data URL prefix if present.
+    """
+    normalized: List[Dict[str, Any]] = []
+    if not images:
+        return normalized
+
+    for img in images:
+        if not img or not img.data:
+            continue
+        data = img.data
+        if data.startswith("data:") and "," in data:
+            data = data.split(",", 1)[1]
+        normalized.append({"name": img.name or "", "mime": img.mime or "", "data": data})
+    return normalized
+
+
+def _store_search(query: str, user_id: str, limit: int = 3) -> List[str]:
+    if not store:
+        return []
+    namespace = (user_id, "memories")
+    try:
+        results = store.search(namespace, query=query or "", limit=limit)
+        texts: List[str] = []
+        for item in results:
+            value = getattr(item, "value", {}) or {}
+            if isinstance(value, dict):
+                text = value.get("content") or value.get("text") or value.get("data")
+                if text:
+                    texts.append(str(text))
+            elif isinstance(value, str):
+                texts.append(value)
+        return untrusted(texts[:limit], source="stored_memory")
+    except Exception as e:
+        logger.debug(f"Store search failed: {e}")
+        return []
+
+
+def _store_add(query: str, content: str, user_id: str):
+    if not store or not content:
+        return
+    namespace = (user_id, "memories")
+    try:
+        key = f"mem_{uuid.uuid4().hex}"
+        store.put(namespace, key, {"query": redact_text(query), "content": untrusted(content, source="memory_write")})
+    except Exception as e:
+        logger.debug(f"Store add failed: {e}")
+
+
+@app.post("/api/support/chat")
+async def support_chat(request: Request, payload: SupportChatRequest):
+    """Simple customer support chat backed by Mem0 memory."""
+    try:
+        internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+        principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+        user_id = (
+            principal_id
+            if internal_key and principal_id
+            else (payload.user_id or "default_user")
+        )
+        state = {
+            "messages": [
+                SystemMessage(content="You are a helpful support assistant."),
+                HumanMessage(content=payload.message),
+            ],
+            "user_id": user_id,
+        }
+        config = {"configurable": {"thread_id": user_id or "support_default"}}
+        # Inject stored memories if present
+        store_memories = _store_search(payload.message, user_id=state["user_id"])
+        if store_memories:
+            state["messages"].insert(
+                0,
+                SystemMessage(
+                    content="Stored memories:\n" + "\n".join(f"- {m}" for m in store_memories)
+                ),
+            )
+
+        result = support_graph.invoke(state, config=config)
+        messages = result.get("messages", [])
+        reply = ""
+        for msg in reversed(messages):
+            if hasattr(msg, "content"):
+                reply = msg.content
+                break
+        if not reply:
+            reply = "No response generated."
+        _store_add(payload.message, reply, user_id=state["user_id"])
+        return SupportChatResponse(content=reply, timestamp=datetime.now().isoformat())
+    except Exception as e:
+        logger.error(f"Support chat error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def stream_agent_events(
+    input_text: str,
+    thread_id: str = "default",
+    model: str | None = None,
+    search_mode: Dict[str, Any] | None = None,
+    agent_id: str | None = None,
+    images: Optional[List[Dict[str, Any]]] = None,
+    user_id: Optional[str] = None,
+):
+    """
+    Stream agent execution events in real-time.
+
+    Converts LangGraph events to Vercel AI SDK format.
+    Supports cancellation via cancellation_manager.
+    """
+    event_count = 0
+    input_text = redact_text(input_text)
+    security_context = current_context.get()
+    if security_context:
+        security_context.thread_id = thread_id
+    start_time = time.time()
+    was_interrupted = False
+    emit_main_text = False
+    use_zh = _contains_cjk(input_text)
+    last_thinking_text = ""
+    images = images or []
+    user_id = user_id or settings.memory_user_id
+    model = (model or settings.primary_model).strip()
+    agent_id = (agent_id or "default").strip() or "default"
+    agent_profile = get_agent_profile(agent_id) or get_agent_profile("default")
+
+    # Optional per-thread log handler for easier debugging
+    thread_handler = None
+    root_logger = logging.getLogger()
+    if settings.enable_file_logging:
+        try:
+            log_path = Path(settings.log_file)
+            thread_log_dir = log_path.parent / "threads"
+            thread_log_dir.mkdir(parents=True, exist_ok=True)
+            thread_log_file = thread_log_dir / f"{thread_id}.log"
+
+            # Reuse formatter from existing handlers if available
+            formatter = None
+            if root_logger.handlers:
+                formatter = root_logger.handlers[0].formatter
+            thread_handler = logging.FileHandler(thread_log_file, encoding="utf-8")
+            if formatter:
+                thread_handler.setFormatter(formatter)
+            thread_handler.setLevel(root_logger.level)
+            root_logger.addHandler(thread_handler)
+            logger.info(f"Thread log file attached: {thread_log_file}")
+        except Exception as e:
+            logger.warning(f"Failed to attach thread log handler: {e}")
+
+    # 鍒涘缓鍙栨秷浠ょ墝
+    cancel_token = await cancellation_manager.create_token(
+        thread_id,
+        metadata={
+            "model": model,
+            "input_preview": input_text[:100],
+            # Used for internal-auth per-user isolation in admin/debug endpoints.
+            "user_id": user_id,
+        },
+    )
+
+    # Set up event emitter for tool visualization
+    emitter = await get_emitter(thread_id)
+    event_queue: asyncio.Queue = asyncio.Queue()
+    event_available = asyncio.Event()
+    next_event_task = None
+
+    async def tool_event_listener(event):
+        """Forward tool events to the queue for SSE streaming."""
+        await event_queue.put(event)
+        event_available.set()
+
+    emitter.on_event(tool_event_listener)
+
+    try:
+        logger.info(f"Agent stream started | Thread: {thread_id} | Model: {model}")
+        logger.debug(f"  Input: {input_text[:100]}...")
+
+        mode_info = _normalize_search_mode(search_mode)
+        metrics = metrics_registry.start(thread_id, model=model, route=mode_info.get("mode", ""))
+
+        # Initialize state with cancellation support
+        initial_state: AgentState = {
+            "input": input_text,
+            "images": images,
+            "needs_clarification": False,
+            "tool_approved": False,
+            "pending_tool_calls": [],
+            "user_id": user_id,
+            "messages": [],
+            "research_plan": [],
+            "current_step": 0,
+            "scraped_content": [],
+            "code_results": [],
+            "final_report": "",
+            "draft_report": "",
+            "evaluation": "",
+            "verdict": "",
+            "route": "",
+            "revision_count": 0,
+            "max_revisions": settings.max_revisions,
+            "tool_call_count": 0,
+            "is_complete": False,
+            "errors": [],
+            # 鍙栨秷鎺у埗瀛楁
+            "cancel_token_id": thread_id,
+            "is_cancelled": False,
+        }
+
+        # Load long-term memories (store) and Mem0 (optional) and inject deep prompt if needed
+        messages: list[Any] = []
+        if mode_info.get("mode") == "agent" and agent_profile and agent_profile.system_prompt:
+            messages.append(SystemMessage(content=agent_profile.system_prompt))
+        if mode_info.get("use_deep_prompt"):
+            messages.append(SystemMessage(content=get_deep_agent_prompt()))
+
+        store_memories = _store_search(input_text, user_id=user_id)
+        if store_memories:
+            store_text = "\n".join(f"- {m}" for m in store_memories)
+            messages.append(HumanMessage(content=f"Untrusted stored memories:\n{store_text}"))
+
+        mem_entries = fetch_memories(query=input_text, user_id=user_id)
+        if mem_entries:
+            memory_text = "\n".join(f"- {m}" for m in mem_entries)
+            messages.append(HumanMessage(content=f"Untrusted recalled knowledge:\n{memory_text}"))
+
+        if messages:
+            initial_state["messages"] = messages
+
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "model": model,
+                "search_mode": mode_info,
+                "agent_profile": agent_profile.model_dump(mode="json") if agent_profile else None,
+                "user_id": user_id,
+                "allow_interrupts": bool(checkpointer),
+                "tool_approval": settings.tool_approval or False,
+                "human_review": settings.human_review or False,
+                "max_revisions": settings.max_revisions,
+            },
+            "recursion_limit": 50,
+        }
+
+        async def _drain_pending_tool_events() -> None:
+            while not event_queue.empty():
+                try:
+                    tool_event = event_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+                if tool_event.type == ToolEvent.TOOL_START:
+                    yield_event = await format_stream_event("tool_start", tool_event.data)
+                elif tool_event.type == ToolEvent.TOOL_SCREENSHOT:
+                    yield_event = await format_stream_event("screenshot", tool_event.data)
+                elif tool_event.type == ToolEvent.TOOL_RESULT:
+                    yield_event = await format_stream_event("tool_result", tool_event.data)
+                elif tool_event.type == ToolEvent.TOOL_ERROR:
+                    yield_event = await format_stream_event("tool_error", tool_event.data)
+                elif tool_event.type == ToolEvent.TASK_UPDATE:
+                    yield_event = await format_stream_event("task_update", tool_event.data)
+                elif tool_event.type == ToolEvent.RESEARCH_NODE_START:
+                    yield_event = await format_stream_event("research_node_start", tool_event.data)
+                elif tool_event.type == ToolEvent.RESEARCH_NODE_COMPLETE:
+                    yield_event = await format_stream_event("research_node_complete", tool_event.data)
+                elif tool_event.type == ToolEvent.RESEARCH_TREE_UPDATE:
+                    yield_event = await format_stream_event("research_tree_update", tool_event.data)
+                elif tool_event.type == ToolEvent.QUALITY_UPDATE:
+                    yield_event = await format_stream_event("quality_update", tool_event.data)
+                elif tool_event.type == ToolEvent.SEARCH:
+                    yield_event = await format_stream_event("search", tool_event.data)
+                elif tool_event.type == ToolEvent.SECURITY:
+                    yield_event = await format_stream_event("security", tool_event.data)
+                else:
+                    continue
+
+                yield yield_event
+            event_available.clear()
+
+        # Send initial status
+        yield await format_stream_event(
+            "status",
+            {"text": "Initializing research agent...", "step": "init", "thread_id": thread_id},
+        )
+
+        # Stream graph execution
+        graph_events = research_graph.astream_events(initial_state, config=config)
+        graph_iter = graph_events.__aiter__()
+
+        while True:
+            async for queued_chunk in _drain_pending_tool_events():
+                yield queued_chunk
+
+            # Check cancellation status
+            if cancel_token.is_cancelled:
+                logger.info(f"Stream cancelled for thread {thread_id}")
+                yield await format_stream_event(
+                    "cancelled", {"message": "Task was cancelled by user", "thread_id": thread_id}
+                )
+                return
+
+            next_event_task = asyncio.create_task(graph_iter.__anext__())
+            try:
+                while True:
+                    event_waiter = asyncio.create_task(event_available.wait())
+                    try:
+                        done, _pending = await asyncio.wait(
+                            {next_event_task, event_waiter}, timeout=0.05,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        event_waiter.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await event_waiter
+                    async for queued_chunk in _drain_pending_tool_events():
+                        yield queued_chunk
+
+                    if cancel_token.is_cancelled:
+                        next_event_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await next_event_task
+                        logger.info(f"Stream cancelled for thread {thread_id}")
+                        yield await format_stream_event(
+                            "cancelled",
+                            {"message": "Task was cancelled by user", "thread_id": thread_id},
+                        )
+                        return
+
+                    if next_event_task in done:
+                        break
+
+                event = next_event_task.result()
+            except StopAsyncIteration:
+                break
+
+            event_type = event.get("event")
+            name = event.get("name", "") or event.get("run_name", "")
+            data_dict = event.get("data", {})
+            node_name = name.lower() if isinstance(name, str) else ""
+
+            # Handle different event types
+            if event_type in {"on_chain_start", "on_node_start", "on_graph_start"}:
+                event_count += 1
+                metrics.mark_event(event_type, node_name)
+                emit_main_text = _should_emit_main_text_for_node(node_name)
+                # Emit a short, safe narrative line to make the accordion feel more "DeepSeek-like".
+                try:
+                    intro = _thinking_intro_for_node(node_name, use_zh=use_zh)
+                    intro = _sanitize_thinking_text(intro, max_len=240)
+                    if intro and intro != last_thinking_text:
+                        last_thinking_text = intro
+                        yield await format_stream_event(
+                            "thinking",
+                            {"text": intro, "node": node_name},
+                        )
+                except Exception:
+                    pass
+                if "clarify" in node_name:
+                    logger.debug(f"  Clarify node started | Thread: {thread_id}")
+                    yield await format_stream_event(
+                        "status",
+                        {"text": "Checking if clarification is needed...", "step": "clarifying"},
+                    )
+                elif "planner" in node_name:
+                    logger.debug(f"  Planning node started | Thread: {thread_id}")
+                    yield await format_stream_event(
+                        "status", {"text": "Creating research plan...", "step": "planning"}
+                    )
+                elif "deepsearch" in node_name:
+                    logger.debug(f"  Deep research node started | Thread: {thread_id}")
+                    text = (
+                        "正在进行 Deep Research（多轮检索→阅读→汇总），可能需要几分钟…"
+                        if use_zh
+                        else "Running Deep Research (iterative search → read → synthesize)…"
+                    )
+                    yield await format_stream_event(
+                        "status",
+                        {"text": text, "step": "deep_research"},
+                    )
+                elif "perform_parallel_search" in node_name or "search" in node_name:
+                    logger.debug(f"  Search node started | Thread: {thread_id}")
+                    yield await format_stream_event(
+                        "status", {"text": "Conducting research...", "step": "researching"}
+                    )
+                elif "writer" in node_name:
+                    logger.debug(f"  Writer node started | Thread: {thread_id}")
+                    yield await format_stream_event(
+                        "status", {"text": "Synthesizing findings...", "step": "writing"}
+                    )
+                elif node_name == "agent":
+                    logger.debug(f"  Agent node started | Thread: {thread_id}")
+                    yield await format_stream_event(
+                        "status", {"text": "Running agent (tool-calling)...", "step": "agent"}
+                    )
+
+            elif event_type in {"on_chain_end", "on_node_end", "on_graph_end"}:
+                output = data_dict.get("output", {}) if isinstance(data_dict, dict) else {}
+                metrics.mark_event(event_type, node_name)
+
+                # Extract messages from output
+                if isinstance(output, dict):
+                    # Interrupt handling
+                    interrupts = output.get("__interrupt__")
+                    if interrupts:
+                        was_interrupted = True
+                        yield await format_stream_event(
+                            "interrupt",
+                            {"thread_id": thread_id, "prompts": _serialize_interrupts(interrupts)},
+                        )
+                        return
+
+                    # Optional "thinking summary" (safe progress narrative) — keep separate from main answer.
+                    if _should_emit_thinking_summary_for_node(node_name) and not output.get("is_complete"):
+                        try:
+                            messages = output.get("messages", [])
+                            for msg in messages or []:
+                                content = msg.content if hasattr(msg, "content") else str(msg)
+                                safe = _sanitize_thinking_text(content)
+                                if not safe or _looks_like_structured_blob(safe):
+                                    continue
+                                yield await format_stream_event(
+                                    "thinking",
+                                    {"text": safe, "node": node_name},
+                                )
+                        except Exception:
+                            pass
+
+                    # Check for completion and final report artifact
+                    if output.get("is_complete"):
+                        final_report = output.get("final_report", "")
+                        if final_report:
+                            try:
+                                candidates: List[Dict[str, Any]] = []
+                                scraped_content = output.get("scraped_content")
+                                if isinstance(scraped_content, list):
+                                    candidates.extend(scraped_content)
+                                raw_sources = output.get("sources")
+                                if isinstance(raw_sources, list):
+                                    candidates.extend(raw_sources)
+
+                                sources = extract_message_sources(candidates)
+                                if sources:
+                                    yield await format_stream_event(
+                                        "sources", {"items": sources}
+                                    )
+                            except Exception:
+                                pass
+
+                            yield await format_stream_event("completion", {"content": final_report})
+
+                            # Also emit as artifact
+                            yield await format_stream_event(
+                                "artifact",
+                                {
+                                    "id": f"report_{datetime.now().timestamp()}",
+                                    "type": "report",
+                                    "title": "Research Report",
+                                    "content": final_report,
+                                },
+                            )
+                            # Store memory for future sessions
+                            # Store memory (long-term)
+                            add_memory_entry(final_report)
+                            # Store interaction (question + answer)
+                            store_interaction(input_text, final_report)
+                            # Store to graph store
+                            _store_add(input_text, final_report, user_id=user_id)
+
+            elif event_type == "on_tool_start":
+                tool_name = str(data_dict.get("name", "unknown") or "unknown")
+                tool_input = data_dict.get("input", {})
+                tool_call_id = str(event.get("run_id") or "") or None
+
+                args_preview = _compact_tool_args(tool_input)
+                payload: Dict[str, Any] = {
+                    "name": tool_name,
+                    "status": "running",
+                }
+                if tool_call_id:
+                    payload["toolCallId"] = tool_call_id
+                if args_preview:
+                    payload["args"] = args_preview
+                    query = args_preview.get("query")
+                    if isinstance(query, str) and query:
+                        payload["query"] = query
+
+                yield await format_stream_event("tool", payload)
+
+            elif event_type == "on_tool_error":
+                tool_name = str(data_dict.get("name", "unknown") or "unknown")
+                tool_input = data_dict.get("input", {})
+                tool_call_id = str(event.get("run_id") or "") or None
+
+                args_preview = _compact_tool_args(tool_input)
+                payload: Dict[str, Any] = {
+                    "name": tool_name,
+                    "status": "failed",
+                }
+                if tool_call_id:
+                    payload["toolCallId"] = tool_call_id
+                if args_preview:
+                    payload["args"] = args_preview
+                    query = args_preview.get("query")
+                    if isinstance(query, str) and query:
+                        payload["query"] = query
+
+                yield await format_stream_event("tool", payload)
+
+            elif event_type == "on_tool_end":
+                tool_name = str(data_dict.get("name", "unknown") or "unknown")
+                output = data_dict.get("output", {})
+                tool_call_id = str(event.get("run_id") or "") or None
+
+                payload: Dict[str, Any] = {
+                    "name": tool_name,
+                    "status": "completed",
+                }
+                if tool_call_id:
+                    payload["toolCallId"] = tool_call_id
+
+                yield await format_stream_event("tool", payload)
+
+                # Check for artifacts from code execution
+                if tool_name == "execute_python_code" and isinstance(output, dict):
+                    image_data = output.get("image")
+
+                    if image_data:
+                        yield await format_stream_event(
+                            "artifact",
+                            {
+                                "id": f"art_{datetime.now().timestamp()}",
+                                "type": "chart",
+                                "title": "Generated Visualization",
+                                "content": "Chart generated from Python code",
+                                "image": image_data,
+                            },
+                        )
+                # Browser screenshots (optional Playwright)
+                if tool_name == "browser_screenshot" and isinstance(output, dict):
+                    image_data = output.get("image")
+                    url = output.get("url", "")
+                    if image_data:
+                        yield await format_stream_event(
+                            "artifact",
+                            {
+                                "id": f"art_{datetime.now().timestamp()}",
+                                "type": "chart",
+                                "title": "Browser Screenshot",
+                                "content": url or "Screenshot",
+                                "image": image_data,
+                            },
+                        )
+                # Sandbox browser tools (E2B + Playwright CDP)
+                if tool_name.startswith("sb_browser_") and isinstance(output, dict):
+                    image_data = output.get("image")
+                    url = output.get("url", "")
+                    if isinstance(image_data, str) and image_data.strip():
+                        yield await format_stream_event(
+                            "artifact",
+                            {
+                                "id": f"art_{datetime.now().timestamp()}",
+                                "type": "chart",
+                                "title": f"Sandbox Browser ({tool_name})",
+                                "content": url or tool_name,
+                                "image": image_data,
+                            },
+                        )
+
+            elif event_type in {"on_chat_model_stream", "on_llm_stream"}:
+                # Stream LLM tokens
+                chunk = data_dict.get("chunk") or data_dict.get("output")
+                if chunk is not None:
+                    content = None
+                    if hasattr(chunk, "content"):
+                        content = chunk.content
+                    elif isinstance(chunk, dict):
+                        content = chunk.get("content")
+                    if content and emit_main_text and not settings.security_enabled:
+                        yield await format_stream_event("text", {"content": content})
+
+        async for queued_chunk in _drain_pending_tool_events():
+            yield queued_chunk
+
+        # Send final completion
+        duration = time.time() - start_time
+        cancel_token.mark_completed()
+        metrics_registry.finish(thread_id, cancelled=False)
+        logger.info(
+            f"вњ?Agent stream completed | Thread: {thread_id} | "
+            f"Events: {event_count} | Duration: {duration:.2f}s"
+        )
+        yield await format_stream_event(
+            "done",
+            {
+                "timestamp": datetime.now().isoformat(),
+                "metrics": metrics_registry.get(thread_id).to_dict()
+                if metrics_registry.get(thread_id)
+                else {},
+            },
+        )
+
+    except asyncio.CancelledError:
+        duration = time.time() - start_time
+        metrics_registry.finish(thread_id, cancelled=True)
+        logger.info(f"? Agent stream cancelled | Thread: {thread_id} | Duration: {duration:.2f}s")
+        yield await format_stream_event(
+            "cancelled",
+            {"message": "Task was cancelled", "thread_id": thread_id, "duration": duration},
+        )
+
+    except Exception as e:
+        duration = time.time() - start_time
+        cancel_token.mark_failed(str(e))
+        metrics_registry.finish(thread_id, cancelled=False)
+        logger.error(
+            f"? Agent stream error | Thread: {thread_id} | "
+            f"Duration: {duration:.2f}s | Error: {str(e)}",
+            exc_info=True,
+        )
+        yield await format_stream_event("error", {"message": str(e)})
+
+    finally:
+        # Cleanup event emitter listener
+        if next_event_task is not None and not next_event_task.done():
+            next_event_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await next_event_task
+        try:
+            emitter.off_event(tool_event_listener)
+            await remove_emitter(thread_id)
+        except Exception:
+            pass
+        # ???????
+        if thread_id in active_streams:
+            del active_streams[thread_id]
+        if thread_handler:
+            try:
+                root_logger.removeHandler(thread_handler)
+                thread_handler.close()
+            except Exception:
+                pass
+        # Clean up browser sessions when the run is truly finished.
+        # If the graph interrupted (HITL), keep sessions so /api/interrupt/resume can continue.
+        if not was_interrupted:
+            try:
+                browser_sessions.reset(thread_id)
+            except Exception:
+                pass
+            # If the UI is actively streaming browser frames for this thread,
+            # keep the sandbox session alive; tearing it down here can stall the
+            # SSE response (slow E2B shutdown) and breaks the live viewer.
+            if _browser_stream_conn_active(thread_id):
+                logger.info(
+                    f"Skipping sandbox browser reset for thread={thread_id} (browser stream active)"
+                )
+            else:
+                # Avoid blocking the request/event loop on slow sandbox shutdown.
+                try:
+                    asyncio.create_task(asyncio.to_thread(sandbox_browser_sessions.reset, thread_id))
+                except Exception:
+                    try:
+                        sandbox_browser_sessions.reset(thread_id)
+                    except Exception:
+                        pass
+
+
+@app.post("/api/chat/sse")
+async def chat_sse(request: Request, payload: ChatRequest):
+    """
+    Standard SSE chat endpoint.
+
+    This endpoint translates the existing legacy `0:{json}\\n` stream protocol
+    into standard SSE frames (`event:` / `data:`) so the frontend can use an
+    off-the-shelf SSE parser.
+    """
+    # Get the last user message (same rule as /api/chat).
+    user_messages = [msg for msg in payload.messages if msg.role == "user"]
+    if not user_messages:
+        raise HTTPException(status_code=400, detail="No user message found")
+
+    last_message = user_messages[-1].content
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+    user_id = principal_id if internal_key and principal_id else (payload.user_id or settings.memory_user_id)
+    mode_info = _normalize_search_mode(payload.search_mode)
+    model = (payload.model or settings.primary_model).strip()
+    thread_id = f"thread_{uuid.uuid4().hex}"
+    set_thread_owner(thread_id, getattr(request.state, "principal_id", "") or "anonymous")
+
+    async def _sse_generator():
+        gauge = None
+        try:
+            gauge = sse_active_connections.labels("chat_sse")
+            gauge.inc()
+        except Exception:
+            gauge = None
+
+        try:
+            seq = 0
+            # Hint clients (EventSource) how long to wait before attempting reconnects.
+            try:
+                if await request.is_disconnected():
+                    return
+            except Exception:
+                pass
+            yield format_sse_retry(2000)
+
+            # Deterministic failure mode when no API key is configured.
+            # We keep this fast and side-effect free (no graph compilation/run).
+            if not (settings.openai_api_key or "").strip():
+                seq += 1
+                yield format_sse_event(
+                    event="error",
+                    data={"message": "OPENAI_API_KEY is not configured", "thread_id": thread_id},
+                    event_id=seq,
+                )
+                seq += 1
+                yield format_sse_event(event="done", data={"thread_id": thread_id}, event_id=seq)
+                return
+
+            source = iter_with_sse_keepalive(
+                stream_agent_events(
+                    last_message,
+                    thread_id=thread_id,
+                    model=model,
+                    search_mode=mode_info,
+                    agent_id=payload.agent_id,
+                    images=_normalize_images_payload(payload.images),
+                    user_id=user_id,
+                ),
+                interval_s=15.0,
+            )
+
+            async for maybe_line in iter_abort_on_disconnect(
+                source,
+                is_disconnected=request.is_disconnected,
+                check_interval_s=0.25,
+            ):
+                # Keepalive comments are already SSE frames.
+                if maybe_line.startswith(":"):
+                    yield maybe_line
+                    continue
+
+                seq += 1
+                sse = translate_legacy_line_to_sse(maybe_line, seq=seq)
+                if sse:
+                    yield sse
+        finally:
+            try:
+                if gauge is not None:
+                    gauge.dec()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        _sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "X-Thread-ID": thread_id,
+        },
+    )
+
+
+@app.post("/api/chat")
+async def chat(request: Request, payload: ChatRequest):
+    """
+    Main chat endpoint with streaming support.
+
+    Compatible with Vercel AI SDK useChat hook.
+    """
+    thread_id = None
+    try:
+        # Get the last user message
+        user_messages = [msg for msg in payload.messages if msg.role == "user"]
+        if not user_messages:
+            logger.warning("Chat request received with no user messages")
+            raise HTTPException(status_code=400, detail="No user message found")
+
+        last_message = user_messages[-1].content
+        internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+        principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+        user_id = principal_id if internal_key and principal_id else (payload.user_id or settings.memory_user_id)
+        mode_info = _normalize_search_mode(payload.search_mode)
+        model = (payload.model or settings.primary_model).strip()
+        agent_id = (payload.agent_id or "default").strip() or "default"
+        agent_profile = get_agent_profile(agent_id) or get_agent_profile("default")
+
+        logger.info("Chat request received")
+        logger.info(f"  Model: {model}")
+        logger.info(f"  Raw search_mode: {payload.search_mode}")
+        logger.info(f"  Normalized mode_info: {mode_info}")
+        logger.info(f"  Final mode: {mode_info.get('mode')}")
+        logger.info(f"  Stream: {payload.stream}")
+        logger.info(f"  Message length: {len(last_message)} chars")
+        logger.debug(f"  Message preview: {last_message[:200]}...")
+
+        if payload.stream:
+            thread_id = f"thread_{uuid.uuid4().hex}"
+            logger.info(f"Starting streaming response | Thread: {thread_id}")
+            set_thread_owner(thread_id, principal_id or "anonymous")
+
+            # Return streaming response with thread_id in header for cancellation
+            return StreamingResponse(
+                stream_agent_events(
+                    last_message,
+                    thread_id=thread_id,
+                    model=model,
+                    search_mode=mode_info,
+                    agent_id=payload.agent_id,
+                    images=_normalize_images_payload(payload.images),
+                    user_id=user_id,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "X-Thread-ID": thread_id,  # ?????????
+                },
+            )
+        else:
+            # Non-streaming response (fallback)
+            initial_state: AgentState = {
+                "input": last_message,
+                "images": _normalize_images_payload(payload.images),
+                "needs_clarification": False,
+                "tool_approved": False,
+                "pending_tool_calls": [],
+                "user_id": user_id,
+                "messages": [],
+                "research_plan": [],
+                "current_step": 0,
+                "scraped_content": [],
+                "code_results": [],
+                "final_report": "",
+                "draft_report": "",
+                "evaluation": "",
+                "verdict": "",
+                "route": mode_info.get("mode", "direct"),
+                "revision_count": 0,
+                "max_revisions": settings.max_revisions,
+                "is_complete": False,
+                "errors": [],
+            }
+
+            messages: list[Any] = []
+            if mode_info.get("mode") == "agent" and agent_profile and agent_profile.system_prompt:
+                messages.append(SystemMessage(content=agent_profile.system_prompt))
+            if mode_info.get("use_deep_prompt"):
+                messages.append(SystemMessage(content=get_deep_agent_prompt()))
+
+            store_memories = _store_search(last_message, user_id=user_id)
+            if store_memories:
+                store_text = "\n".join(f"- {m}" for m in store_memories)
+                messages.append(HumanMessage(content=f"Untrusted stored memories:\n{store_text}"))
+
+            mem_entries = fetch_memories(query=last_message, user_id=user_id)
+            if mem_entries:
+                memory_text = "\n".join(f"- {m}" for m in mem_entries)
+                messages.append(HumanMessage(content=f"Untrusted recalled knowledge:\n{memory_text}"))
+
+            if messages:
+                initial_state["messages"] = messages
+
+            config = {
+                "configurable": {
+                    "thread_id": "default",
+                    "model": model,
+                    "search_mode": mode_info,
+                    "agent_profile": agent_profile.model_dump(mode="json")
+                    if agent_profile
+                    else None,
+                    "user_id": user_id,
+                    "allow_interrupts": bool(checkpointer),
+                    "tool_approval": settings.tool_approval or False,
+                    "human_review": settings.human_review or False,
+                    "max_revisions": settings.max_revisions,
+                },
+                "recursion_limit": 50,
+            }
+            thread_id = thread_id or f"thread_{uuid.uuid4().hex}"
+            metrics = metrics_registry.start(
+                thread_id, model=model, route=mode_info.get("mode", "direct")
+            )
+            result = await research_graph.ainvoke(initial_state, config=config)
+            final_report = result.get("final_report", "No response generated")
+            add_memory_entry(final_report)
+            store_interaction(last_message, final_report)
+            _store_add(last_message, final_report, user_id=user_id)
+            metrics_registry.finish(thread_id, cancelled=False)
+
+            return ChatResponse(
+                id=f"msg_{datetime.now().timestamp()}",
+                content=final_report,
+                timestamp=datetime.now().isoformat(),
+            )
+
+    except Exception as e:
+        logger.error(
+            f"鉁?Chat error | Thread: {thread_id or 'N/A'} | "
+            f"Model: {model if 'model' in locals() else (payload.model if 'payload' in locals() else 'N/A')} | "
+            f"Error: {str(e)}",
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/interrupt/resume")
+async def resume_interrupt(request: Request, payload: GraphInterruptResumeRequest):
+    """
+    Resume a LangGraph execution after an interrupt.
+    """
+    if not checkpointer:
+        raise HTTPException(status_code=400, detail="Interrupts require a checkpointer")
+
+    mode_info = _normalize_search_mode(payload.search_mode)
+    model = (payload.model or settings.primary_model).strip()
+    agent_id = (payload.agent_id or "default").strip() or "default"
+    agent_profile = get_agent_profile(agent_id) or get_agent_profile("default")
+    # Fast path: avoid invoking the graph when no checkpoint exists for this thread.
+    if not payload.thread_id or not str(payload.thread_id).strip():
+        raise HTTPException(status_code=400, detail="thread_id is required")
+    _require_thread_owner(request, payload.thread_id)
+    security_context = current_context.get()
+    if security_context:
+        security_context.thread_id = payload.thread_id
+    if isinstance(payload.payload, dict) and "approval_id" in payload.payload:
+        try:
+            if not security_context:
+                raise ApprovalError("Trusted execution context is required")
+            SecurityStore().validate(str(payload.payload["approval_id"]), security_context.principal, payload.thread_id)
+        except ApprovalError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from error
+    existing = checkpointer.get_tuple({"configurable": {"thread_id": payload.thread_id}})
+    if not existing:
+        raise HTTPException(status_code=404, detail="No checkpoint found for this thread_id")
+    config = {
+        "configurable": {
+            "thread_id": payload.thread_id,
+            "model": model,
+            "search_mode": mode_info,
+            "agent_profile": agent_profile.model_dump(mode="json") if agent_profile else None,
+            "allow_interrupts": True,
+            "tool_approval": settings.tool_approval or False,
+            "human_review": settings.human_review or False,
+            "max_revisions": settings.max_revisions,
+        },
+        "recursion_limit": 50,
+    }
+
+    try:
+        resume_payload = _normalize_interrupt_resume_payload(payload.payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    result = await research_graph.ainvoke(Command(resume=resume_payload), config=config)
+    interrupts = _serialize_interrupts(result.get("__interrupt__"))
+    if interrupts:
+        return {"status": "interrupted", "interrupts": interrupts}
+
+    final_report = result.get("final_report", "")
+    return ChatResponse(
+        id=f"msg_{datetime.now().timestamp()}",
+        content=final_report,
+        timestamp=datetime.now().isoformat(),
+    )
+
+
+@app.get("/api/security/events/{thread_id}")
+async def security_events(request: Request, thread_id: str):
+    _require_thread_owner(request, thread_id)
+    context = current_context.get()
+    principal = context.principal if context else "local"
+    return {"events": SecurityStore().events(principal, thread_id)}
+
+
+@app.get("/api/mcp/config")
+async def get_mcp_config():
+    """Return current MCP enable flag, servers config, and loaded tool count."""
+    return {
+        "enabled": mcp_enabled,
+        "servers": mcp_servers_config,
+        "loaded_tools": mcp_loaded_tools,
+    }
+
+
+@app.get("/api/tools/registry", response_model=ToolRegistryResponse)
+async def get_tool_registry():
+    """Return current ToolRegistry stats + tool metadata (best-effort)."""
+    from tools.core.registry import get_global_registry
+
+    registry = get_global_registry()
+    raw_stats = registry.get_statistics()
+
+    most_used: List[ToolRegistryMostUsed] = []
+    for entry in raw_stats.get("most_used", []) or []:
+        try:
+            name, call_count = entry
+            most_used.append(ToolRegistryMostUsed(name=str(name), call_count=int(call_count)))
+        except Exception:
+            continue
+
+    stats = ToolRegistryStats(
+        total_tools=int(raw_stats.get("total_tools", 0) or 0),
+        enabled_tools=int(raw_stats.get("enabled_tools", 0) or 0),
+        deprecated_tools=int(raw_stats.get("deprecated_tools", 0) or 0),
+        total_calls=int(raw_stats.get("total_calls", 0) or 0),
+        total_successes=int(raw_stats.get("total_successes", 0) or 0),
+        overall_success_rate=float(raw_stats.get("overall_success_rate", 0.0) or 0.0),
+        most_used=most_used,
+        by_type={str(k): int(v) for k, v in (raw_stats.get("by_type") or {}).items()},
+        tags=[str(t) for t in (raw_stats.get("tags") or [])],
+    )
+
+    tools_payload: List[ToolRegistryTool] = []
+    for m in registry.list_metadata():
+        try:
+            as_dict = m.to_dict()
+            as_dict["success_rate"] = float(getattr(m, "success_rate", 0.0) or 0.0)
+            tools_payload.append(ToolRegistryTool(**as_dict))
+        except Exception:
+            continue
+
+    tools_payload.sort(key=lambda t: t.name)
+    return {"stats": stats, "tools": tools_payload}
+
+
+@app.post("/api/tools/registry/refresh", response_model=ToolRegistryRefreshResponse)
+async def refresh_tool_registry(reset: bool = False):
+    """
+    Re-run enhanced tool discovery at runtime.
+
+    Notes:
+    - This is intended for dev/debug (e.g., after editing tool modules).
+    - `reset=true` clears the global registry before discovery.
+    """
+    from agent.workflows.nodes import initialize_enhanced_tools
+    from tools.core.registry import get_global_registry, reset_global_registry
+
+    if reset:
+        reset_global_registry()
+
+    registry = get_global_registry()
+    before = len(registry.list_names())
+
+    initialize_enhanced_tools()
+
+    after = len(get_global_registry().list_names())
+    return {"discovered": max(0, after - before), "total_tools": after}
+
+
+@app.get("/api/search/providers", response_model=SearchProvidersResponse)
+async def get_search_providers():
+    """Expose multi-search provider availability, health, and circuit-breaker state."""
+    orchestrator = get_search_orchestrator()
+    providers: List[SearchProviderSnapshot] = []
+
+    for provider in orchestrator.providers:
+        circuit = orchestrator.reliability_manager.snapshot(provider.name)
+        last_error = provider.stats.last_error
+        if last_error:
+            try:
+                from tools.search.providers import _sanitize_error_message
+
+                last_error = _sanitize_error_message(last_error)
+            except Exception:
+                pass
+        providers.append(
+            SearchProviderSnapshot(
+                name=provider.name,
+                available=bool(provider.is_available()),
+                healthy=bool(provider.stats.is_healthy),
+                total_calls=int(provider.stats.total_calls),
+                success_count=int(provider.stats.success_count),
+                error_count=int(provider.stats.error_count),
+                success_rate=float(provider.stats.success_rate),
+                avg_latency_ms=float(provider.stats.avg_latency_ms),
+                avg_result_quality=float(provider.stats.avg_result_quality),
+                last_error=last_error,
+                last_error_time=provider.stats.last_error_time,
+                circuit=ProviderCircuitSnapshot(
+                    is_open=bool(circuit.get("is_open", False)),
+                    consecutive_failures=int(circuit.get("consecutive_failures", 0) or 0),
+                    opened_for_seconds=circuit.get("opened_for_seconds"),
+                    resets_in_seconds=circuit.get("resets_in_seconds"),
+                ),
+            )
+        )
+
+    return {"providers": providers}
+
+
+@app.post("/api/search/providers/reset", response_model=SearchProvidersResetResponse)
+async def reset_search_providers():
+    """Reset the global multi-search orchestrator (provider stats + circuit breaker state)."""
+    from tools.search.multi_search import reset_search_orchestrator
+
+    reset_search_orchestrator()
+    return {"reset": True}
+
+
+@app.get("/api/search/cache/stats", response_model=SearchCacheStatsResponse)
+async def get_search_cache_stats():
+    """Return in-memory search cache statistics (LRU + TTL)."""
+    from agent.core.search_cache import get_search_cache
+
+    cache = get_search_cache()
+    return {"stats": cache.stats()}
+
+
+@app.post("/api/search/cache/clear", response_model=SearchCacheClearResponse)
+async def clear_search_cache_endpoint():
+    """Clear the in-memory search cache (best-effort)."""
+    from agent.core.search_cache import clear_search_cache
+
+    clear_search_cache()
+    return {"cleared": True}
+
+
+# ==================== Agents (GPTs-like profiles) ====================
+
+
+@app.get("/api/agents", response_model=AgentsListResponse)
+async def list_agents():
+    profiles = load_agents()
+    return {"agents": profiles}
+
+
+@app.get("/api/agents/{agent_id}")
+async def get_agent(agent_id: str):
+    profile = get_agent_profile(agent_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return profile.model_dump(mode="json")
+
+
+@app.post("/api/agents")
+async def create_agent(payload: AgentUpsertPayload):
+    agent_id = (payload.id or "").strip() or f"agent_{uuid.uuid4().hex[:10]}"
+    profile = AgentProfile(
+        id=agent_id,
+        name=payload.name.strip(),
+        description=payload.description or "",
+        system_prompt=payload.system_prompt or "",
+        model=(payload.model or "").strip(),
+        enabled_tools=payload.enabled_tools or {},
+        mcp_servers=payload.mcp_servers,
+        metadata=payload.metadata or {},
+    )
+    saved = upsert_agent_profile(profile)
+    return saved.model_dump(mode="json")
+
+
+@app.put("/api/agents/{agent_id}")
+async def update_agent(agent_id: str, payload: AgentUpsertPayload):
+    existing = get_agent_profile(agent_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent_id == "default":
+        raise HTTPException(status_code=400, detail="Default agent is protected")
+
+    profile = existing.model_copy(
+        update={
+            "name": payload.name.strip(),
+            "description": payload.description or "",
+            "system_prompt": payload.system_prompt or "",
+            "model": (payload.model or "").strip(),
+            "enabled_tools": payload.enabled_tools or {},
+            "mcp_servers": payload.mcp_servers,
+            "metadata": payload.metadata or {},
+        }
+    )
+    saved = upsert_agent_profile(profile)
+    return saved.model_dump(mode="json")
+
+
+@app.delete("/api/agents/{agent_id}")
+async def remove_agent(agent_id: str):
+    if agent_id == "default":
+        raise HTTPException(status_code=400, detail="Default agent is protected")
+    ok = delete_agent_profile(agent_id, protected_ids={"default"})
+    if not ok:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return {"status": "deleted", "id": agent_id}
+
+
+@app.post("/api/mcp/config")
+async def update_mcp_config(request: Request, payload: MCPConfigPayload):
+    """Update MCP enable flag and servers config at runtime."""
+    global mcp_enabled, mcp_servers_config, mcp_loaded_tools
+    if settings.security_enabled and settings.internal_api_key:
+        context = current_context.get()
+        admins = {item.strip() for item in settings.security_admin_principals.split(",") if item.strip()}
+        if not context or context.principal not in admins:
+            raise HTTPException(status_code=403, detail="MCP configuration requires a security administrator")
+
+    if payload.enable is not None:
+        mcp_enabled = bool(payload.enable)
+    if payload.servers is not None:
+        mcp_servers_config = payload.servers
+
+    if mcp_enabled and mcp_servers_config:
+        try:
+            cfg = _apply_mcp_thread_id(mcp_servers_config, mcp_thread_id)
+            mcp_servers_config = cfg
+            tools = await reload_mcp_tools(cfg, enabled=True)
+            set_registered_tools(tools)
+            mcp_loaded_tools = len(tools)
+        except Exception as e:
+            logger.error(f"Failed to reload MCP tools: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Failed to reload MCP tools")
+    else:
+        await close_mcp_tools()
+        set_registered_tools([])
+        mcp_loaded_tools = 0
+
+    return {
+        "enabled": mcp_enabled,
+        "servers": mcp_servers_config,
+        "loaded_tools": mcp_loaded_tools,
+    }
+
+
+@app.get("/api/runs")
+async def list_runs(request: Request):
+    """List in-memory run metrics (per thread)."""
+    runs = metrics_registry.all()
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    if internal_key:
+        principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+        runs = [
+            run
+            for run in runs
+            if (get_thread_owner(str(run.get("run_id") or "")) or "").strip() == principal_id
+        ]
+    return {"runs": runs}
+
+
+class RunEvidenceSummary(BaseModel):
+    sources_count: int
+    unsupported_claims_count: int
+    freshness_ratio_30d: Optional[float] = None
+    citation_coverage: Optional[float] = None
+    query_coverage_score: Optional[float] = None
+    freshness_warning: Optional[str] = None
+    claim_verifier_total: Optional[int] = None
+    claim_verifier_verified: Optional[int] = None
+    claim_verifier_unsupported: Optional[int] = None
+    claim_verifier_contradicted: Optional[int] = None
+
+
+class RunMetricsResponse(BaseModel):
+    run_id: str
+    model: str
+    route: str = ""
+    started_at: str
+    ended_at: Optional[str] = None
+    duration_ms: float
+    event_count: int
+    nodes_started: Dict[str, int]
+    nodes_completed: Dict[str, int]
+    errors: List[str]
+    cancelled: bool
+    evidence_summary: RunEvidenceSummary
+
+
+def _build_run_evidence_summary(thread_id: str) -> RunEvidenceSummary:
+    sources_count = 0
+    unsupported_claims_count = 0
+    freshness_ratio_30d: Optional[float] = None
+    citation_coverage: Optional[float] = None
+    query_coverage_score: Optional[float] = None
+    freshness_warning: Optional[str] = None
+    claim_verifier_total: Optional[int] = None
+    claim_verifier_verified: Optional[int] = None
+    claim_verifier_unsupported: Optional[int] = None
+    claim_verifier_contradicted: Optional[int] = None
+
+    if not checkpointer:
+        return RunEvidenceSummary(
+            sources_count=sources_count,
+            unsupported_claims_count=unsupported_claims_count,
+            freshness_ratio_30d=freshness_ratio_30d,
+            citation_coverage=citation_coverage,
+            query_coverage_score=query_coverage_score,
+            freshness_warning=freshness_warning,
+            claim_verifier_total=claim_verifier_total,
+            claim_verifier_verified=claim_verifier_verified,
+            claim_verifier_unsupported=claim_verifier_unsupported,
+            claim_verifier_contradicted=claim_verifier_contradicted,
+        )
+
+    try:
+        from common.session_manager import get_session_manager
+
+        manager = get_session_manager(checkpointer)
+        session_state = manager.get_session_state(thread_id)
+        if not session_state:
+            raise ValueError("session not found")
+
+        artifacts = session_state.deepsearch_artifacts or {}
+        if not isinstance(artifacts, dict):
+            raise TypeError("deepsearch_artifacts is not a dict")
+
+        sources = artifacts.get("sources", [])
+        if isinstance(sources, list):
+            sources_count = len(sources)
+
+        claims = artifacts.get("claims", [])
+        if isinstance(claims, list):
+            for claim in claims:
+                if not isinstance(claim, dict):
+                    continue
+                status = (claim.get("status") or "").strip().lower()
+                if status in ("unsupported", "contradicted"):
+                    unsupported_claims_count += 1
+
+        freshness_summary = artifacts.get("freshness_summary", {})
+        if isinstance(freshness_summary, dict):
+            ratio = freshness_summary.get("fresh_30_ratio")
+            if ratio is not None:
+                try:
+                    freshness_ratio_30d = float(ratio)
+                except (TypeError, ValueError):
+                    freshness_ratio_30d = None
+
+        quality_summary = artifacts.get("quality_summary", {})
+        if isinstance(quality_summary, dict):
+            raw_citation = quality_summary.get("citation_coverage", quality_summary.get("citation_coverage_score"))
+            if raw_citation is not None:
+                try:
+                    citation_coverage = float(raw_citation)
+                except (TypeError, ValueError):
+                    citation_coverage = None
+
+            raw_query_coverage = quality_summary.get("query_coverage_score")
+            if raw_query_coverage is None:
+                nested_coverage = quality_summary.get("query_coverage")
+                if isinstance(nested_coverage, dict):
+                    raw_query_coverage = nested_coverage.get("score")
+            if raw_query_coverage is None:
+                nested_query_coverage = artifacts.get("query_coverage")
+                if isinstance(nested_query_coverage, dict):
+                    raw_query_coverage = nested_query_coverage.get("score")
+            if raw_query_coverage is not None:
+                try:
+                    query_coverage_score = float(raw_query_coverage)
+                except (TypeError, ValueError):
+                    query_coverage_score = None
+
+            freshness_warning_raw = quality_summary.get("freshness_warning")
+            if isinstance(freshness_warning_raw, str) and freshness_warning_raw.strip():
+                freshness_warning = freshness_warning_raw.strip()
+
+            def _maybe_int(value: Any) -> Optional[int]:
+                if value is None:
+                    return None
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+
+            claim_verifier_total = _maybe_int(quality_summary.get("claim_verifier_total"))
+            claim_verifier_verified = _maybe_int(quality_summary.get("claim_verifier_verified"))
+            claim_verifier_unsupported = _maybe_int(quality_summary.get("claim_verifier_unsupported"))
+            claim_verifier_contradicted = _maybe_int(quality_summary.get("claim_verifier_contradicted"))
+
+    except Exception:
+        # Evidence summary is best-effort; never fail the metrics endpoint for this.
+        pass
+
+    return RunEvidenceSummary(
+        sources_count=sources_count,
+        unsupported_claims_count=unsupported_claims_count,
+        freshness_ratio_30d=freshness_ratio_30d,
+        citation_coverage=citation_coverage,
+        query_coverage_score=query_coverage_score,
+        freshness_warning=freshness_warning,
+        claim_verifier_total=claim_verifier_total,
+        claim_verifier_verified=claim_verifier_verified,
+        claim_verifier_unsupported=claim_verifier_unsupported,
+        claim_verifier_contradicted=claim_verifier_contradicted,
+    )
+
+
+@app.get("/api/runs/{thread_id}", response_model=RunMetricsResponse)
+async def get_run_metrics(thread_id: str, request: Request):
+    """Get metrics for a specific run/thread."""
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    if internal_key:
+        principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+        owner_id = (get_thread_owner(thread_id) or "").strip()
+        if owner_id and principal_id and owner_id != principal_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+    metrics = metrics_registry.get(thread_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run not found")
+    payload = metrics.to_dict()
+    return RunMetricsResponse(
+        **payload,
+        evidence_summary=_build_run_evidence_summary(thread_id),
+    )
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint."""
+    data = generate_latest()
+    return StreamingResponse(iter([data]), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/api/memory/status")
+async def memory_status():
+    """Return memory backend status and configuration."""
+    backend = settings.memory_store_backend
+    url = settings.memory_store_url
+    return {
+        "backend": backend,
+        "url_configured": bool(url),
+        "checkpointer": bool(checkpointer),
+        "mem0_enabled": settings.enable_memory,
+    }
+
+
+@app.get("/api/config/public", response_model=PublicConfigResponse)
+async def public_config():
+    """
+    Public, non-secret runtime configuration for frontend bootstrapping.
+
+    This endpoint is intentionally safe to expose: it must not include API keys,
+    tokens, raw MCP server configs, or any user data.
+    """
+
+    def _public_model_options() -> List[str]:
+        """
+        A conservative allowlist for the frontend model dropdown.
+
+        Goal: avoid offering models that are unlikely to work with the configured
+        provider/gateway (e.g. selecting GPT-4o when OPENAI_BASE_URL points to DeepSeek).
+        """
+
+        def _norm(value: Any) -> str:
+            if not isinstance(value, str):
+                return ""
+            return value.strip()
+
+        def _is_openai_family(name: str) -> bool:
+            lowered = name.lower()
+            return "gpt" in lowered or lowered.startswith("o1") or lowered.startswith("o3")
+
+        def _is_anthropic_family(name: str) -> bool:
+            return "claude" in name.lower()
+
+        def _is_deepseek_family(name: str) -> bool:
+            return "deepseek" in name.lower()
+
+        def _is_qwen_family(name: str) -> bool:
+            return "qwen" in name.lower()
+
+        def _is_glm_family(name: str) -> bool:
+            lowered = name.lower()
+            return lowered.startswith("glm") or "glm" in lowered
+
+        primary = _norm(settings.primary_model)
+        reasoning = _norm(settings.reasoning_model)
+        base_url = _norm(settings.openai_base_url).lower()
+        opts: list[str] = []
+        seen: set[str] = set()
+
+        def _add(name: str) -> None:
+            name = _norm(name)
+            if not name:
+                return
+            key = name.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            opts.append(name)
+
+        # Always allow the configured primary model.
+        _add(primary)
+
+        # Provider-aware suggestions.
+        if _is_deepseek_family(primary) or "deepseek" in base_url:
+            _add("deepseek-chat")
+            _add("deepseek-reasoner")
+            if _is_deepseek_family(reasoning):
+                _add(reasoning)
+        elif _is_anthropic_family(primary):
+            if (settings.anthropic_api_key or "").strip():
+                _add("claude-sonnet-4-5-20250514")
+                _add("claude-opus-4-20250514")
+                _add("claude-sonnet-4-20250514")
+            if _is_anthropic_family(reasoning):
+                _add(reasoning)
+        elif _is_openai_family(primary):
+            if (settings.openai_api_key or "").strip():
+                _add("gpt-5")
+                _add("gpt-4.1")
+                _add("gpt-4o")
+                _add("o1-mini")
+                if _is_openai_family(reasoning):
+                    _add(reasoning)
+        elif _is_qwen_family(primary) or "dashscope" in base_url or "aliyuncs" in base_url:
+            _add("qwen-plus")
+            _add("qwen3-vl-flash")
+            if _is_qwen_family(reasoning):
+                _add(reasoning)
+        elif _is_glm_family(primary) or "bigmodel" in base_url or "zhipu" in base_url:
+            _add("glm-4.6")
+            _add("glm-4.6v")
+            if _is_glm_family(reasoning):
+                _add(reasoning)
+
+        # Include task-specific overrides if they are explicitly configured.
+        for attr in ("planner_model", "researcher_model", "writer_model", "evaluator_model", "critic_model"):
+            _add(_norm(getattr(settings, attr, "")))
+
+        return opts
+
+    return {
+        "version": app.version,
+        "defaults": {
+            "port": settings.port,
+            "primary_model": settings.primary_model,
+            "reasoning_model": settings.reasoning_model,
+        },
+        "models": {
+            "default": settings.primary_model,
+            "options": _public_model_options(),
+        },
+        "features": {
+            "mcp_enabled": bool(mcp_enabled),
+            "sandbox_mode": settings.sandbox_mode,
+            "prometheus_enabled": bool(settings.enable_prometheus),
+            "tracing_enabled": bool(settings.enable_tracing),
+        },
+        "streaming": {
+            "chat": {"protocol": "sse", "endpoint": "/api/chat/sse"},
+            "research": {"protocol": "sse", "endpoint": "/api/research/sse"},
+            "events": {"protocol": "sse", "endpoint": "/api/events/{thread_id}"},
+            "browser": {"protocol": "ws", "endpoint": "/api/browser/{thread_id}/stream"},
+        },
+    }
+
+
+@app.get("/api/sandbox/browser/diagnose", response_model=SandboxBrowserDiagnoseResponse)
+async def sandbox_browser_diagnose(deep: bool = False):
+    """
+    Diagnose whether the E2B sandbox-backed browser tools are configured.
+
+    Fast path: validates env/config and local dependencies without cold-starting a sandbox.
+    Use this to troubleshoot "Capture failed: ..." errors in `/api/browser/{thread_id}/stream`.
+    """
+    import importlib.util
+    import os
+
+    missing: list[str] = []
+
+    e2b_key = (settings.e2b_api_key or "").strip()
+    if not e2b_key:
+        missing.append("E2B_API_KEY")
+    elif not e2b_key.startswith("e2b_"):
+        missing.append("E2B_API_KEY (invalid)")
+
+    template = (os.getenv("SANDBOX_TEMPLATE_BROWSER") or settings.sandbox_template_browser or "").strip()
+    if not template:
+        missing.append("SANDBOX_TEMPLATE_BROWSER")
+
+    deps = {
+        "e2b_code_interpreter": bool(importlib.util.find_spec("e2b_code_interpreter")),
+        "playwright": bool(importlib.util.find_spec("playwright")),
+    }
+    for dep, present in deps.items():
+        if not present:
+            missing.append(f"pip:{dep}")
+
+    ready = not missing
+
+    deep_result: Dict[str, Any] | None = None
+    if deep and ready:
+        diag_thread = f"diagnose_{uuid.uuid4().hex[:8]}"
+        started = time.time()
+
+        def _capture_one_frame() -> int:
+            session = sandbox_browser_sessions.get(diag_thread)
+            page = session.get_page()
+            try:
+                page.goto("about:blank")
+            except Exception:
+                pass
+
+            try:
+                jpg = page.screenshot(
+                    type="jpeg",
+                    quality=50,
+                    full_page=False,
+                    animations="disabled",
+                    caret="hide",
+                )
+            except TypeError:
+                jpg = page.screenshot(type="jpeg", quality=50, full_page=False)
+            return len(jpg or b"")
+
+        try:
+            frame_bytes = await sandbox_browser_sessions.run_async(diag_thread, _capture_one_frame)
+            deep_result = {
+                "ok": True,
+                "latency_ms": int((time.time() - started) * 1000),
+                "frame_bytes": int(frame_bytes or 0),
+            }
+        except Exception as e:
+            deep_result = {
+                "ok": False,
+                "latency_ms": int((time.time() - started) * 1000),
+                "error": str(e),
+            }
+        finally:
+            try:
+                sandbox_browser_sessions.reset(diag_thread)
+            except Exception:
+                pass
+
+    return {
+        "ready": ready,
+        "missing": missing,
+        "sandbox_mode": settings.sandbox_mode,
+        "allow_internet": bool(getattr(settings, "sandbox_allow_internet", True)),
+        "configured": {
+            "e2b_api_key": bool(e2b_key),
+            "sandbox_template_browser": bool(template),
+            **deps,
+        },
+        "deep": deep_result,
+    }
+
+
+# ==================== Tracing API ====================
+
+
+@app.get("/api/traces/{thread_id}")
+async def get_traces(thread_id: str, request: Request):
+    """
+    Get traces for a thread.
+
+    Returns the latest trace with full span tree.
+    """
+    from common.tracing import get_trace
+
+    if not settings.enable_tracing:
+        raise HTTPException(status_code=400, detail="Tracing is not enabled")
+
+    _require_thread_owner(request, thread_id)
+
+    trace = get_trace(thread_id)
+    if not trace:
+        raise HTTPException(status_code=404, detail=f"No traces found for thread {thread_id}")
+
+    return trace
+
+
+@app.get("/api/traces/{thread_id}/summary")
+async def get_trace_summary(thread_id: str, request: Request):
+    """
+    Get trace summary for a thread.
+
+    Returns high-level statistics: token counts, durations, node breakdown.
+    """
+    from common.tracing import get_trace_summary as _get_summary
+
+    if not settings.enable_tracing:
+        raise HTTPException(status_code=400, detail="Tracing is not enabled")
+
+    _require_thread_owner(request, thread_id)
+
+    summary = _get_summary(thread_id)
+    if not summary:
+        raise HTTPException(status_code=404, detail=f"No traces found for thread {thread_id}")
+
+    return summary
+
+
+@app.get("/api/traces/{thread_id}/all")
+async def get_all_traces(thread_id: str, request: Request):
+    """
+    Get all traces for a thread.
+
+    Returns list of all stored traces (up to buffer limit).
+    """
+    from common.tracing import get_all_traces as _get_all
+
+    if not settings.enable_tracing:
+        raise HTTPException(status_code=400, detail="Tracing is not enabled")
+
+    _require_thread_owner(request, thread_id)
+
+    traces = _get_all(thread_id)
+    return {"thread_id": thread_id, "count": len(traces), "traces": traces}
+
+
+# ==================== Report Export API ====================
+
+
+class ExportRequest(BaseModel):
+    """Export request for generating reports in various formats."""
+    format: str = "html"  # html, pdf, docx
+    title: Optional[str] = None
+
+
+@app.get("/api/export/templates")
+async def list_export_templates():
+    """
+    List available export templates.
+
+    Note: This route must be registered before `/api/export/{thread_id}`.
+    Otherwise, the dynamic route will capture `templates` as a thread_id and
+    this endpoint becomes unreachable.
+    """
+    return {
+        "templates": [
+            {
+                "id": "default",
+                "name": "Default",
+                "description": "Standard research report format with Weaver branding",
+            },
+            {
+                "id": "academic",
+                "name": "Academic",
+                "description": "Formal serif font style for research papers with proper citations",
+            },
+            {
+                "id": "business",
+                "name": "Business",
+                "description": "Professional business report with gradient header and modern layout",
+            },
+            {
+                "id": "minimal",
+                "name": "Minimal",
+                "description": "Clean, distraction-free formatting focused on content",
+            },
+        ]
+    }
+
+
+@app.get("/api/export/{thread_id}")
+async def export_report_endpoint(
+    thread_id: str,
+    request: Request,
+    format: str = "html",
+    title: Optional[str] = None,
+    template: str = "default",
+):
+    """
+    Export a research report for a given thread.
+
+    Args:
+        thread_id: Thread ID to export report for
+        format: Output format (html, pdf, docx)
+        title: Optional custom title for the report
+        template: Template style (default, academic, business, minimal)
+    """
+    if not checkpointer:
+        raise HTTPException(status_code=400, detail="No checkpointer configured")
+
+    try:
+        _require_thread_owner(request, thread_id)
+        config = {"configurable": {"thread_id": thread_id}}
+        checkpoint = checkpointer.get_tuple(config)
+        if not checkpoint:
+            raise HTTPException(status_code=404, detail=f"No checkpoint found for thread {thread_id}")
+
+        state = checkpoint.checkpoint.get("channel_values", {})
+        final_report = state.get("final_report", "")
+        if not final_report:
+            raise HTTPException(status_code=404, detail="No report found for this thread")
+
+        scraped = state.get("scraped_content", [])
+        extracted_sources = []
+        try:
+            if isinstance(scraped, list):
+                extracted_sources = extract_message_sources(scraped)
+        except Exception:
+            extracted_sources = []
+
+        source_urls = [
+            s.get("url")
+            for s in extracted_sources
+            if isinstance(s, dict) and isinstance(s.get("url"), str) and s.get("url")
+        ]
+
+        report_title = title or "Research Report"
+        format_lower = format.lower().strip()
+
+        if format_lower == "json":
+            deepsearch_artifacts = state.get("deepsearch_artifacts", {}) or {}
+            if not isinstance(deepsearch_artifacts, dict):
+                deepsearch_artifacts = {}
+
+            sources_payload = deepsearch_artifacts.get("sources")
+            if not isinstance(sources_payload, list):
+                sources_payload = extracted_sources
+
+            claims_payload = deepsearch_artifacts.get("claims")
+            if not isinstance(claims_payload, list):
+                claims_payload = []
+                try:
+                    from agent.workflows.claim_verifier import ClaimVerifier
+
+                    scraped_list = scraped if isinstance(scraped, list) else []
+                    passages_payload = deepsearch_artifacts.get("passages")
+                    passages_list = passages_payload if isinstance(passages_payload, list) else None
+
+                    if (scraped_list or passages_list) and isinstance(final_report, str) and final_report.strip():
+                        verifier = ClaimVerifier()
+                        checks = verifier.verify_report(
+                            final_report,
+                            scraped_list,
+                            passages=passages_list,
+                        )
+                        claims_payload = [
+                            {
+                                "claim": c.claim,
+                                "status": c.status.value,
+                                "evidence_urls": c.evidence_urls,
+                                "evidence_passages": c.evidence_passages,
+                                "score": c.score,
+                                "notes": c.notes,
+                            }
+                            for c in checks
+                        ]
+                except Exception:
+                    claims_payload = []
+
+            quality_payload = deepsearch_artifacts.get("quality_summary")
+            if not isinstance(quality_payload, dict):
+                quality_payload = state.get("quality_summary", {}) or {}
+                if not isinstance(quality_payload, dict):
+                    quality_payload = {}
+
+            return StarletteJSONResponse(
+                status_code=200,
+                content={
+                    "thread_id": thread_id,
+                    "title": report_title,
+                    "report": final_report,
+                    "sources": sources_payload,
+                    "claims": claims_payload,
+                    "quality": quality_payload,
+                    "exported_at": datetime.now().isoformat(),
+                },
+                headers={"Content-Disposition": f'attachment; filename="report_{thread_id}.json"'},
+            )
+
+        if format_lower == "html":
+            from tools.export import export_report as do_export
+
+            html_content = do_export(
+                final_report, format="html", title=report_title,
+                thread_id=thread_id, sources=source_urls,
+            )
+            return StreamingResponse(
+                iter([html_content.encode("utf-8") if isinstance(html_content, str) else html_content]),
+                media_type="text/html",
+                headers={"Content-Disposition": f'inline; filename="report_{thread_id}.html"'},
+            )
+
+        elif format_lower == "pdf":
+            try:
+                from tools.export import export_report as do_export
+
+                pdf_bytes = do_export(
+                    final_report, format="pdf", title=report_title,
+                    thread_id=thread_id, sources=source_urls,
+                )
+                return StreamingResponse(
+                    iter([pdf_bytes if isinstance(pdf_bytes, bytes) else pdf_bytes.encode("utf-8")]),
+                    media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="report_{thread_id}.pdf"'},
+                )
+            except ImportError as e:
+                raise HTTPException(status_code=501, detail=f"PDF export requires WeasyPrint: {e}")
+
+        elif format_lower in ("docx", "doc"):
+            try:
+                from tools.export import export_report as do_export
+
+                docx_bytes = do_export(
+                    final_report, format="docx", title=report_title,
+                    thread_id=thread_id, sources=source_urls,
+                )
+                return StreamingResponse(
+                    iter([docx_bytes if isinstance(docx_bytes, bytes) else docx_bytes.encode("utf-8")]),
+                    media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    headers={"Content-Disposition": f'attachment; filename="report_{thread_id}.docx"'},
+                )
+            except ImportError as e:
+                raise HTTPException(status_code=501, detail=f"DOCX export requires python-docx: {e}")
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported format: {format}. Use html, pdf, or docx.")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Export error for thread {thread_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== RAG Document API ====================
+
+
+def _rag_collection_for_request(request: Request) -> str:
+    """
+    Resolve the Chroma collection name for RAG documents.
+
+    Hybrid behavior:
+    - Default/dev (internal auth disabled): single shared collection
+    - Enterprise internal (internal auth enabled): per-principal isolated collection
+    """
+    base = (getattr(settings, "rag_collection_name", "") or "weaver_documents").strip() or "weaver_documents"
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    if not internal_key:
+        return base
+
+    principal_id = (getattr(request.state, "principal_id", "") or "").strip() or "internal"
+    suffix = hashlib.sha256(principal_id.encode("utf-8")).hexdigest()[:12]
+    return f"{base}__u_{suffix}"
+
+
+@app.post("/api/documents/upload")
+async def upload_document(request: Request, file: UploadFile = File(...)):
+    """
+    Upload a document to the RAG knowledge base.
+
+    Supports PDF, DOCX, TXT, MD files.
+    """
+    if not settings.rag_enabled:
+        raise HTTPException(status_code=400, detail="RAG is not enabled. Set rag_enabled=True in settings.")
+
+    # Validate file size (max 50MB)
+    MAX_FILE_SIZE = 50 * 1024 * 1024
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB.")
+
+    # Validate file extension
+    ALLOWED_EXTENSIONS = {"pdf", "docx", "doc", "txt", "md", "csv"}
+    filename = file.filename or ""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type '.{ext}'. Allowed: {', '.join(ALLOWED_EXTENSIONS)}")
+
+    try:
+        from tools.rag.rag_tool import get_rag_tool
+
+        rag = get_rag_tool(collection_name=_rag_collection_for_request(request))
+        if rag is None:
+            raise HTTPException(status_code=500, detail="Failed to initialize RAG tool")
+
+        result = rag.add_document(content=content, filename=file.filename)
+
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Upload failed"))
+
+        return {
+            "success": True,
+            "filename": file.filename,
+            "chunks": result.get("chunks", 0),
+            "message": f"Document '{file.filename}' uploaded successfully with {result.get('chunks', 0)} chunks",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Document upload error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/documents/list")
+async def list_documents(request: Request, limit: int = 100):
+    """
+    List all documents in the RAG knowledge base.
+    """
+    if not settings.rag_enabled:
+        raise HTTPException(status_code=400, detail="RAG is not enabled.")
+
+    try:
+        from tools.rag.rag_tool import get_rag_tool
+
+        rag = get_rag_tool(collection_name=_rag_collection_for_request(request))
+        if rag is None:
+            raise HTTPException(status_code=500, detail="Failed to initialize RAG tool")
+
+        documents = rag.list_documents(limit=limit)
+        count = rag.count()
+
+        return {
+            "total_chunks": count,
+            "documents": documents,
+        }
+
+    except Exception as e:
+        logger.error(f"List documents error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/documents/{source:path}")
+async def delete_document(source: str, request: Request):
+    """
+    Delete a document from the RAG knowledge base by source path.
+    """
+    if not settings.rag_enabled:
+        raise HTTPException(status_code=400, detail="RAG is not enabled.")
+
+    try:
+        from tools.rag.rag_tool import get_rag_tool
+
+        rag = get_rag_tool(collection_name=_rag_collection_for_request(request))
+        if rag is None:
+            raise HTTPException(status_code=500, detail="Failed to initialize RAG tool")
+
+        result = rag.delete_document(source)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Delete failed"))
+
+        return {"success": True, "message": f"Document '{source}' deleted"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Delete document error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/documents/search")
+async def search_documents(request: Request, query: str, n_results: int = 5):
+    """
+    Search the RAG knowledge base.
+    """
+    if not settings.rag_enabled:
+        raise HTTPException(status_code=400, detail="RAG is not enabled.")
+
+    try:
+        from tools.rag.rag_tool import get_rag_tool
+
+        rag = get_rag_tool(collection_name=_rag_collection_for_request(request))
+        if rag is None:
+            raise HTTPException(status_code=500, detail="Failed to initialize RAG tool")
+
+        results = rag.search(query, n_results=n_results)
+
+        return {
+            "query": query,
+            "results": results,
+        }
+
+    except Exception as e:
+        logger.error(f"Search documents error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== Sessions API ====================
+
+
+class SessionSummary(BaseModel):
+    thread_id: str
+    status: str
+    topic: str
+    created_at: str
+    updated_at: str
+    route: str
+    has_report: bool
+    revision_count: int
+    message_count: int
+
+
+class SessionsListResponse(BaseModel):
+    count: int
+    sessions: List[SessionSummary]
+
+
+class EvidenceSource(BaseModel):
+    title: str = ""
+    url: str
+    rawUrl: Optional[str] = None
+    domain: Optional[str] = None
+    provider: Optional[str] = None
+    publishedDate: Optional[str] = None
+
+
+class EvidenceClaimEvidence(BaseModel):
+    url: str
+    snippet_hash: Optional[str] = None
+    quote: Optional[str] = None
+    heading_path: Optional[List[str]] = None
+
+
+class EvidenceClaim(BaseModel):
+    claim: str
+    status: str
+    evidence_urls: List[str] = []
+    evidence_passages: List[EvidenceClaimEvidence] = []
+    score: float = 0.0
+    notes: str = ""
+
+
+class FetchedPageItem(BaseModel):
+    url: str
+    raw_url: str
+    method: str
+    text: Optional[str] = None
+    title: Optional[str] = None
+    published_date: Optional[str] = None
+    retrieved_at: Optional[str] = None
+    markdown: Optional[str] = None
+    http_status: Optional[int] = None
+    error: Optional[str] = None
+    attempts: int = 1
+
+
+class EvidencePassageItem(BaseModel):
+    url: str
+    text: str
+    start_char: int
+    end_char: int
+    heading: Optional[str] = None
+    heading_path: Optional[List[str]] = None
+    page_title: Optional[str] = None
+    retrieved_at: Optional[str] = None
+    method: Optional[str] = None
+    quote: Optional[str] = None
+    snippet_hash: Optional[str] = None
+
+
+class EvidenceResponse(BaseModel):
+    sources: List[EvidenceSource] = []
+    claims: List[EvidenceClaim] = []
+    quality_summary: Dict[str, Any] = {}
+    fetched_pages: List[FetchedPageItem] = []
+    passages: List[EvidencePassageItem] = []
+
+
+@app.get("/api/sessions", response_model=SessionsListResponse)
+async def list_sessions(
+    request: Request,
+    limit: int = 50,
+    status: Optional[str] = None,
+):
+    """
+    List all research sessions.
+
+    Args:
+        limit: Maximum sessions to return
+        status: Filter by status (pending, running, completed, cancelled)
+    """
+    if not checkpointer:
+        raise HTTPException(status_code=400, detail="No checkpointer configured")
+
+    try:
+        from common.session_manager import get_session_manager
+
+        manager = get_session_manager(checkpointer)
+        internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+        user_filter = None
+        if internal_key:
+            user_filter = (getattr(request.state, "principal_id", "") or "").strip() or "internal"
+        sessions = manager.list_sessions(limit=limit, status_filter=status, user_id_filter=user_filter)
+
+        return {
+            "count": len(sessions),
+            "sessions": [s.to_dict() for s in sessions],
+        }
+
+    except Exception as e:
+        logger.error(f"List sessions error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/sessions/{thread_id}")
+async def get_session(thread_id: str, request: Request):
+    """
+    Get session info by thread ID.
+    """
+    if not checkpointer:
+        raise HTTPException(status_code=400, detail="No checkpointer configured")
+
+    try:
+        from common.session_manager import get_session_manager
+
+        manager = get_session_manager(checkpointer)
+
+        internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+        if internal_key:
+            principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+            session_state = manager.get_session_state(thread_id)
+            if session_state and isinstance(session_state.state, dict):
+                owner = session_state.state.get("user_id")
+                if isinstance(owner, str) and owner.strip() and owner.strip() != principal_id:
+                    raise HTTPException(status_code=403, detail="Forbidden")
+
+        session = manager.get_session(thread_id)
+
+        if not session:
+            raise HTTPException(status_code=404, detail=f"Session not found: {thread_id}")
+
+        return session.to_dict()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get session error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/sessions/{thread_id}/state")
+async def get_session_state(thread_id: str, request: Request):
+    """
+    Get full session state snapshot.
+    """
+    if not checkpointer:
+        raise HTTPException(status_code=400, detail="No checkpointer configured")
+
+    try:
+        from common.session_manager import get_session_manager
+
+        manager = get_session_manager(checkpointer)
+        state = manager.get_session_state(thread_id)
+
+        if not state:
+            raise HTTPException(status_code=404, detail=f"Session not found: {thread_id}")
+
+        internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+        if internal_key:
+            principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+            owner = state.state.get("user_id") if isinstance(state.state, dict) else None
+            if isinstance(owner, str) and owner.strip() and owner.strip() != principal_id:
+                raise HTTPException(status_code=403, detail="Forbidden")
+
+        return state.to_dict()
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get session state error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/sessions/{thread_id}/evidence", response_model=EvidenceResponse)
+async def get_session_evidence(thread_id: str, request: Request):
+    """
+    Get evidence artifacts (sources + claims + quality summary) for a session.
+    """
+    if not checkpointer:
+        raise HTTPException(status_code=400, detail="No checkpointer configured")
+
+    try:
+        from common.session_manager import get_session_manager
+
+        manager = get_session_manager(checkpointer)
+        session_state = manager.get_session_state(thread_id)
+        if not session_state:
+            raise HTTPException(status_code=404, detail=f"Session not found: {thread_id}")
+
+        internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+        if internal_key:
+            principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+            owner = session_state.state.get("user_id") if isinstance(session_state.state, dict) else None
+            if isinstance(owner, str) and owner.strip() and owner.strip() != principal_id:
+                raise HTTPException(status_code=403, detail="Forbidden")
+
+        artifacts = session_state.deepsearch_artifacts or {}
+        if not isinstance(artifacts, dict):
+            artifacts = {}
+
+        sources = artifacts.get("sources", [])
+        claims = artifacts.get("claims", [])
+        quality_summary = artifacts.get("quality_summary", {})
+        fetched_pages = artifacts.get("fetched_pages", [])
+        passages = artifacts.get("passages", [])
+
+        return {
+            "sources": sources if isinstance(sources, list) else [],
+            "claims": claims if isinstance(claims, list) else [],
+            "quality_summary": quality_summary if isinstance(quality_summary, dict) else {},
+            "fetched_pages": fetched_pages if isinstance(fetched_pages, list) else [],
+            "passages": passages if isinstance(passages, list) else [],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get session evidence error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SessionResumeRequest(BaseModel):
+    """Request to resume a session."""
+    additional_input: Optional[str] = None
+    update_state: Optional[Dict[str, Any]] = None
+
+
+@app.post("/api/sessions/{thread_id}/resume")
+async def resume_session(
+    thread_id: str,
+    request: Request,
+    payload: SessionResumeRequest | None = None,
+):
+    """
+    Resume a paused or cancelled research session.
+    """
+    if not checkpointer:
+        raise HTTPException(status_code=400, detail="No checkpointer configured")
+
+    try:
+        from common.session_manager import get_session_manager
+
+        _require_thread_owner(request, thread_id)
+
+        manager = get_session_manager(checkpointer)
+
+        # Check if session can be resumed
+        can_resume, reason = manager.can_resume(thread_id)
+        if not can_resume:
+            raise HTTPException(status_code=400, detail=reason)
+
+        # Get current state
+        state = manager.get_session_state(thread_id)
+        if not state:
+            raise HTTPException(status_code=404, detail=f"Session not found: {thread_id}")
+
+        restored_state = manager.build_resume_state(
+            thread_id=thread_id,
+            additional_input=payload.additional_input if payload else None,
+            update_state=payload.update_state if payload else None,
+        )
+        if restored_state is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {thread_id}")
+
+        deepsearch_artifacts = restored_state.get("deepsearch_artifacts", {}) or {}
+        quality_summary = deepsearch_artifacts.get("quality_summary", {}) if isinstance(
+            deepsearch_artifacts, dict
+        ) else {}
+        queries = deepsearch_artifacts.get("queries", []) if isinstance(
+            deepsearch_artifacts, dict
+        ) else []
+        query_coverage = deepsearch_artifacts.get("query_coverage", {}) if isinstance(
+            deepsearch_artifacts, dict
+        ) else {}
+        freshness_summary = deepsearch_artifacts.get("freshness_summary", {}) if isinstance(
+            deepsearch_artifacts, dict
+        ) else {}
+        if not isinstance(query_coverage, dict):
+            query_coverage = {}
+        if not isinstance(freshness_summary, dict):
+            freshness_summary = {}
+        query_coverage_score = query_coverage.get("score")
+        if query_coverage_score is not None:
+            try:
+                query_coverage_score = float(query_coverage_score)
+            except (TypeError, ValueError):
+                query_coverage_score = None
+        if query_coverage_score is None and isinstance(quality_summary, dict):
+            nested_coverage = quality_summary.get("query_coverage")
+            if isinstance(nested_coverage, dict):
+                query_coverage_score = nested_coverage.get("score")
+            if query_coverage_score is None:
+                query_coverage_score = quality_summary.get("query_coverage_score")
+            if query_coverage_score is not None:
+                try:
+                    query_coverage_score = float(query_coverage_score)
+                except (TypeError, ValueError):
+                    query_coverage_score = None
+        freshness_warning = ""
+        if isinstance(quality_summary, dict):
+            freshness_warning = str(quality_summary.get("freshness_warning") or "")
+
+        # Resume the graph execution
+        # Note: Actual resumption depends on the graph implementation
+        # This returns info for the client to continue via SSE
+        return {
+            "success": True,
+            "thread_id": thread_id,
+            "status": "ready_to_resume",
+            "message": f"Session {thread_id} is ready to resume. Use the streaming endpoint with this thread_id.",
+            "current_state": {
+                "route": state.state.get("route"),
+                "revision_count": state.state.get("revision_count", 0),
+                "has_report": bool(state.state.get("final_report")),
+                "has_deepsearch_artifacts": bool(deepsearch_artifacts),
+                "deepsearch_queries": len(queries) if isinstance(queries, list) else 0,
+            },
+            "deepsearch_resume": {
+                "artifacts_restored": bool(deepsearch_artifacts),
+                "mode": deepsearch_artifacts.get("mode") if isinstance(deepsearch_artifacts, dict) else None,
+                "quality_summary": quality_summary if isinstance(quality_summary, dict) else {},
+                "query_coverage_score": query_coverage_score,
+                "freshness_warning": freshness_warning,
+                "freshness_summary": freshness_summary,
+            },
+            "resume_state": {
+                "route": restored_state.get("route"),
+                "revision_count": restored_state.get("revision_count", 0),
+                "research_plan_count": len(restored_state.get("research_plan", []) or []),
+                "resumed_from_checkpoint": bool(restored_state.get("resumed_from_checkpoint")),
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Resume session error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/sessions/{thread_id}")
+async def delete_session(thread_id: str, request: Request):
+    """
+    Delete a research session.
+    """
+    if not checkpointer:
+        raise HTTPException(status_code=400, detail="No checkpointer configured")
+
+    try:
+        from common.session_manager import get_session_manager
+
+        _require_thread_owner(request, thread_id)
+
+        manager = get_session_manager(checkpointer)
+        success = manager.delete_session(thread_id)
+
+        if not success:
+            raise HTTPException(status_code=400, detail=f"Failed to delete session: {thread_id}")
+
+        return {
+            "success": True,
+            "message": f"Session {thread_id} deleted",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Delete session error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== Collaboration API ====================
+
+
+class ShareRequest(BaseModel):
+    """Request to create a share link."""
+    permissions: str = "view"
+    expires_hours: Optional[int] = 72
+
+
+class CommentRequest(BaseModel):
+    """Request to add a comment."""
+    content: str
+    author: str = "anonymous"
+    message_id: Optional[str] = None
+
+
+class SessionComment(BaseModel):
+    id: str
+    thread_id: str
+    message_id: Optional[str] = None
+    author: str
+    content: str
+    created_at: str
+    updated_at: str
+
+
+class CommentsResponse(BaseModel):
+    comments: List[SessionComment]
+    count: int
+
+
+class SessionVersion(BaseModel):
+    id: str
+    thread_id: str
+    version_number: int
+    label: str
+    created_at: str
+    snapshot_size: int
+
+
+class VersionsResponse(BaseModel):
+    versions: List[SessionVersion]
+    count: int
+
+
+@app.post("/api/sessions/{thread_id}/share")
+async def create_share(thread_id: str, request: Request, req: ShareRequest):
+    """Create a share link for a session."""
+    try:
+        _require_thread_owner(request, thread_id)
+        from common.collaboration import create_share_link
+
+        link = create_share_link(
+            thread_id=thread_id,
+            permissions=req.permissions,
+            expires_hours=req.expires_hours,
+        )
+        return {
+            "success": True,
+            "share": link,
+            "url": f"/share/{link['id']}",
+        }
+    except Exception as e:
+        logger.error(f"Create share error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/share/{share_id}")
+async def get_share(share_id: str):
+    """Get shared session content."""
+    try:
+        from common.collaboration import get_share_link
+
+        link = get_share_link(share_id)
+        if not link:
+            raise HTTPException(status_code=404, detail="Share link not found or expired")
+
+        # Get session state if checkpointer available
+        session_data = None
+        if checkpointer:
+            from common.session_manager import get_session_manager
+
+            manager = get_session_manager(checkpointer)
+            session_state = manager.get_session_state(link["thread_id"])
+            if session_state and isinstance(session_state.state, dict):
+                state = session_state.state
+                raw_messages = state.get("messages", [])
+                messages = []
+                if isinstance(raw_messages, list) and raw_messages:
+                    # Keep payload bounded for share views.
+                    for m in raw_messages[-50:]:
+                        try:
+                            role = None
+                            content = None
+
+                            if isinstance(m, dict):
+                                role = m.get("role") or m.get("type") or m.get("name")
+                                content = m.get("content")
+                            else:
+                                role = getattr(m, "role", None) or getattr(m, "type", None)
+                                content = getattr(m, "content", None)
+
+                            if content is None:
+                                content = str(m)
+
+                            role_norm = str(role or "unknown").strip().lower()
+                            if role_norm in {"human", "user"}:
+                                role_norm = "user"
+                            elif role_norm in {"ai", "assistant"}:
+                                role_norm = "assistant"
+                            elif role_norm in {"system"}:
+                                role_norm = "system"
+
+                            messages.append(
+                                {
+                                    "role": role_norm,
+                                    "content": str(content),
+                                }
+                            )
+                        except Exception:
+                            continue
+
+                title = state.get("title") or state.get("topic") or state.get("input") or link["thread_id"]
+                if not isinstance(title, str) or not title.strip():
+                    title = link["thread_id"]
+
+                session_data = {
+                    "id": link["thread_id"],
+                    "title": title.strip(),
+                    "messages": messages,
+                }
+
+        return {
+            "success": True,
+            "share": link,
+            "session": session_data,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get share error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/share/{share_id}")
+async def delete_share(share_id: str):
+    """Delete a share link."""
+    try:
+        from common.collaboration import delete_share_link
+
+        success = delete_share_link(share_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Share link not found")
+        return {"success": True, "id": share_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Delete share error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/sessions/{thread_id}/comments")
+async def add_comment(thread_id: str, request: Request, req: CommentRequest):
+    """Add a comment to a session."""
+    try:
+        _require_thread_owner(request, thread_id)
+        from common.collaboration import add_comment
+
+        comment = add_comment(
+            thread_id=thread_id,
+            content=req.content,
+            author=req.author,
+            message_id=req.message_id,
+        )
+        return {"success": True, "comment": comment}
+    except Exception as e:
+        logger.error(f"Add comment error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/sessions/{thread_id}/comments", response_model=CommentsResponse)
+async def get_comments(thread_id: str, request: Request, message_id: Optional[str] = None):
+    """Get comments for a session."""
+    try:
+        _require_thread_owner(request, thread_id)
+        from common.collaboration import get_comments
+
+        comments = get_comments(thread_id, message_id)
+        return {"comments": comments, "count": len(comments)}
+    except Exception as e:
+        logger.error(f"Get comments error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/sessions/{thread_id}/versions", response_model=VersionsResponse)
+async def get_versions(thread_id: str, request: Request):
+    """Get version history for a session."""
+    try:
+        _require_thread_owner(request, thread_id)
+        from common.collaboration import list_versions
+
+        versions = list_versions(thread_id)
+        return {"versions": versions, "count": len(versions)}
+    except Exception as e:
+        logger.error(f"Get versions error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/sessions/{thread_id}/versions")
+async def create_version(thread_id: str, request: Request, label: Optional[str] = None):
+    """Create a version snapshot of a session."""
+    try:
+        if not checkpointer:
+            raise HTTPException(status_code=400, detail="No checkpointer configured")
+
+        _require_thread_owner(request, thread_id)
+
+        from common.collaboration import save_version
+        from common.session_manager import get_session_manager
+
+        manager = get_session_manager(checkpointer)
+        session = manager.get_session(thread_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # Create snapshot from session state
+        state_snapshot = {
+            "thread_id": session.thread_id,
+            "title": session.title,
+            "messages": session.messages,
+            "metadata": getattr(session, "metadata", {}),
+        }
+
+        version = save_version(thread_id, state_snapshot, label)
+        return {"success": True, "version": version}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Create version error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/sessions/{thread_id}/restore/{version_id}")
+async def restore_version(thread_id: str, version_id: str, request: Request):
+    """Restore a session from a version snapshot."""
+    try:
+        _require_thread_owner(request, thread_id)
+        from common.collaboration import get_version_snapshot
+
+        snapshot = get_version_snapshot(version_id)
+        if not snapshot:
+            raise HTTPException(status_code=404, detail="Version snapshot not found")
+
+        # Note: Full restoration would require re-initializing the session state
+        # For now, just return the snapshot for client-side handling
+        return {
+            "success": True,
+            "snapshot": snapshot,
+            "message": "Version snapshot retrieved. Client should handle restoration.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Restore version error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== HITL Interrupt API ====================
+
+
+class InterruptAction(str, Enum):
+    """Actions for interrupt handling."""
+    APPROVE = "approve"      # Approve and continue
+    MODIFY = "modify"        # Modify state and continue
+    REJECT = "reject"        # Reject and stop
+    SKIP = "skip"            # Skip this checkpoint
+
+
+class InterruptResumeRequest(BaseModel):
+    """Request to resume from an interrupt point."""
+    action: str = "approve"
+    modifications: Optional[Dict[str, Any]] = None
+    feedback: Optional[str] = None
+
+
+@app.get("/api/interrupt/{thread_id}/status")
+async def get_interrupt_status(thread_id: str, request: Request):
+    """
+    Get the current interrupt status for a session.
+
+    Returns information about whether the session is paused at an interrupt point.
+    """
+    if not checkpointer:
+        raise HTTPException(status_code=400, detail="No checkpointer configured")
+
+    try:
+        _require_thread_owner(request, thread_id)
+        config = {"configurable": {"thread_id": thread_id}}
+        checkpoint_tuple = checkpointer.get_tuple(config)
+
+        if not checkpoint_tuple:
+            raise HTTPException(status_code=404, detail=f"Session not found: {thread_id}")
+
+        pending_writes = getattr(checkpoint_tuple, "pending_writes", []) or []
+        interrupt_items: List[Any] = []
+        for entry in pending_writes:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+                continue
+            _, key, value = entry
+            if key != "__interrupt__":
+                continue
+            if isinstance(value, (list, tuple)):
+                interrupt_items.extend(list(value))
+            elif value is not None:
+                interrupt_items.append(value)
+
+        prompts = _serialize_interrupts(interrupt_items)
+        is_interrupted = bool(prompts)
+
+        checkpoint_name: Optional[str] = None
+        available_actions: List[str] = []
+        first = prompts[0] if prompts else None
+        if isinstance(first, dict):
+            cp = first.get("checkpoint")
+            if isinstance(cp, str) and cp.strip():
+                checkpoint_name = cp.strip()
+
+            # Tool approval interrupt (HumanInTheLoopMiddleware) — expose allowed decisions.
+            if "action_requests" in first and "review_configs" in first:
+                checkpoint_name = checkpoint_name or "tool_approval"
+                allowed: set[str] = set()
+                for cfg in first.get("review_configs", []) or []:
+                    if not isinstance(cfg, dict):
+                        continue
+                    for d in cfg.get("allowed_decisions", []) or []:
+                        if isinstance(d, str) and d.strip():
+                            allowed.add(d.strip())
+                if allowed:
+                    available_actions = sorted(allowed)
+
+        if is_interrupted and not available_actions:
+            # Generic interrupts support "approve" (resume as-is) and optional edits
+            # (client can send a structured payload like {"content": "..."}).
+            available_actions = ["approve", "edit"]
+
+        return {
+            "thread_id": thread_id,
+            "is_interrupted": is_interrupted,
+            "interrupt_node": "",
+            "checkpoint_name": checkpoint_name,
+            "checkpoint_info": {},
+            "available_actions": available_actions if is_interrupted else [],
+            "prompts": prompts,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get interrupt status error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/interrupt/{thread_id}/resume")
+async def resume_from_interrupt(thread_id: str, request: Request, payload: InterruptResumeRequest):
+    """
+    Resume execution from an interrupt point.
+
+    Actions:
+    - approve: Continue with current state
+    - modify: Apply modifications and continue
+    - reject: Stop execution
+    - skip: Skip this step and continue
+    """
+    if not checkpointer:
+        raise HTTPException(status_code=400, detail="No checkpointer configured")
+
+    try:
+        _require_thread_owner(request, thread_id)
+        config = {"configurable": {"thread_id": thread_id}}
+        checkpoint_tuple = checkpointer.get_tuple(config)
+
+        if not checkpoint_tuple:
+            raise HTTPException(status_code=404, detail=f"Session not found: {thread_id}")
+
+        action = payload.action.lower()
+
+        if action == "reject":
+            # Mark session as cancelled
+            return {
+                "success": True,
+                "action": "rejected",
+                "message": f"Session {thread_id} execution rejected. Session cancelled.",
+            }
+
+        if action == "modify" and payload.modifications:
+            # Apply modifications would require updating the checkpoint
+            # This is a simplified implementation
+            modifications = payload.modifications
+            logger.info(f"Modifications requested for {thread_id}: {modifications}")
+
+        # For approve/skip/modify, return info for client to resume via SSE
+        return {
+            "success": True,
+            "action": action,
+            "thread_id": thread_id,
+            "message": f"Session {thread_id} ready to resume. Use the streaming endpoint to continue.",
+            "modifications_applied": action == "modify",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Resume from interrupt error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== ASR 璇煶璇嗗埆 API ====================
+
+
+class ASRRequest(BaseModel):
+    """ASR request with base64 audio data."""
+
+    audio_data: str  # Base64 encoded audio
+    format: str = "wav"
+    sample_rate: int = 16000
+    language_hints: Optional[List[str]] = None
+
+
+@app.post("/api/asr/recognize")
+async def recognize_speech(request: ASRRequest):
+    """ASR endpoint receiving Base64 audio data."""
+    try:
+        asr_service = get_asr_service()
+
+        if not asr_service.enabled:
+            # Frontend expects a stable `{success:false, error}` shape even on 503
+            # so it can trigger a browser fallback when the server-side ASR is off.
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "success": False,
+                    "text": "",
+                    "error": "ASR service not available. Please configure DASHSCOPE_API_KEY.",
+                },
+            )
+
+        # 瑙ｇ爜 Base64 闊抽鏁版嵁
+        try:
+            audio_bytes = base64.b64decode(request.audio_data)
+        except Exception as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "text": "",
+                    "error": f"Invalid base64 audio data: {str(e)}",
+                },
+            )
+
+        # 璋冪敤 ASR 鏈嶅姟
+        result = await run_in_threadpool(
+            asr_service.recognize_bytes,
+            audio_data=audio_bytes,
+            format=request.format,
+            sample_rate=request.sample_rate,
+            language_hints=request.language_hints or ["zh", "en"],
+        )
+
+        if result["success"]:
+            return {"success": True, "text": result["text"], "metrics": result.get("metrics", {})}
+        else:
+            return {"success": False, "text": "", "error": result.get("error", "Unknown error")}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"ASR error: {str(e)}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "text": "",
+                "error": f"ASR processing error: {str(e)}",
+            },
+        )
+
+
+@app.post("/api/asr/upload")
+async def recognize_speech_upload(file: UploadFile = File(...), sample_rate: int = 16000):
+    """ASR upload endpoint receiving audio file."""
+    # Validate file size (max 50MB)
+    MAX_AUDIO_SIZE = 50 * 1024 * 1024
+    audio_bytes = await file.read()
+    if len(audio_bytes) > MAX_AUDIO_SIZE:
+        raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_AUDIO_SIZE // (1024*1024)}MB.")
+
+    # Validate audio format
+    VALID_AUDIO_FORMATS = {"wav", "mp3", "m4a", "flac", "ogg", "webm", "pcm"}
+    filename = file.filename or "audio.wav"
+    format_ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "wav"
+    if format_ext not in VALID_AUDIO_FORMATS:
+        raise HTTPException(status_code=400, detail=f"Unsupported audio format '.{format_ext}'. Allowed: {', '.join(VALID_AUDIO_FORMATS)}")
+
+    # Validate sample rate
+    if not (8000 <= sample_rate <= 48000):
+        raise HTTPException(status_code=400, detail="Sample rate must be between 8000 and 48000 Hz.")
+
+    try:
+        asr_service = get_asr_service()
+
+        if not asr_service.enabled:
+            raise HTTPException(
+                status_code=503,
+                detail="ASR service not available. Please configure DASHSCOPE_API_KEY.",
+            )
+
+        result = await run_in_threadpool(
+            asr_service.recognize_bytes,
+            audio_data=audio_bytes,
+            format=format_ext,
+            sample_rate=sample_rate,
+            language_hints=["zh", "en"],
+        )
+
+        if result["success"]:
+            return {"success": True, "text": result["text"], "metrics": result.get("metrics", {})}
+        else:
+            return {"success": False, "text": "", "error": result.get("error", "Unknown error")}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"ASR upload error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"ASR processing error: {str(e)}")
+
+
+@app.get("/api/asr/status")
+async def get_asr_status():
+    """Get ASR service status."""
+    asr_service = get_asr_service()
+    last_error_time = None
+    try:
+        ts = getattr(asr_service, "last_error_time", None)
+        if isinstance(ts, (int, float)) and ts > 0:
+            last_error_time = datetime.fromtimestamp(ts).isoformat()
+    except Exception:
+        last_error_time = None
+    return {
+        "enabled": asr_service.enabled,
+        "api_key_configured": bool(settings.dashscope_api_key),
+        "last_error": getattr(asr_service, "last_error", None),
+        "last_error_time": last_error_time,
+    }
+
+
+# ==================== TTS 鏂囧瓧杞闊?API ====================
+
+
+class TTSRequest(BaseModel):
+    """TTS request payload."""
+
+    text: str
+    voice: str = "longxiaochun"  # 榛樿濂冲０
+
+
+@app.post("/api/tts/synthesize")
+async def synthesize_speech(request: TTSRequest):
+    """Text-to-speech synthesis endpoint."""
+    try:
+        tts_service = get_tts_service()
+
+        if not tts_service.enabled:
+            raise HTTPException(
+                status_code=503,
+                detail="TTS service not available. Please configure DASHSCOPE_API_KEY.",
+            )
+
+        result = await run_in_threadpool(
+            tts_service.synthesize, text=request.text, voice=request.voice
+        )
+
+        if result["success"]:
+            return {
+                "success": True,
+                "audio": result["audio"],
+                "format": result["format"],
+                "voice": result["voice"],
+            }
+        else:
+            return {"success": False, "error": result.get("error", "Unknown error")}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        message = str(e)
+        lowered = message.lower()
+        if "invalidapikey" in lowered or "unauthorized" in lowered or "handshake status 401" in lowered:
+            logger.warning("TTS auth error: %s", message)
+            raise HTTPException(status_code=401, detail=f"TTS authentication error: {message}")
+        logger.error(f"TTS error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"TTS processing error: {message}")
+
+
+@app.get("/api/tts/voices")
+async def get_tts_voices():
+    """Get available TTS voices."""
+    return {"voices": AVAILABLE_VOICES, "default": "longxiaochun"}
+
+
+@app.get("/api/tts/status")
+async def get_tts_status():
+    """Get TTS service status."""
+    tts_service = get_tts_service()
+    last_error_time = None
+    try:
+        ts = getattr(tts_service, "last_error_time", None)
+        if isinstance(ts, (int, float)) and ts > 0:
+            last_error_time = datetime.fromtimestamp(ts).isoformat()
+    except Exception:
+        last_error_time = None
+    return {
+        "enabled": tts_service.enabled,
+        "api_key_configured": bool(settings.dashscope_api_key),
+        "last_error": getattr(tts_service, "last_error", None),
+        "last_error_time": last_error_time,
+    }
+
+
+@app.post("/api/research")
+async def research(request: Request, query: str):
+    """
+    Dedicated research endpoint for long-running queries.
+
+    Returns streaming response with research progress.
+    """
+    thread_id = f"thread_{uuid.uuid4().hex}"
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+    user_id = principal_id if internal_key and principal_id else settings.memory_user_id
+    set_thread_owner(thread_id, principal_id or "anonymous")
+
+    return StreamingResponse(
+        stream_agent_events(query, thread_id=thread_id, user_id=user_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "X-Thread-ID": thread_id,
+        },
+    )
+
+
+@app.post("/api/research/sse")
+async def research_sse(request: Request, payload: ResearchRequest):
+    """
+    Standard SSE research endpoint.
+
+    This endpoint translates the existing legacy `0:{json}\\n` stream protocol
+    into standard SSE frames (`event:` / `data:`) so the frontend can use the
+    same SSE parser as `/api/chat/sse`.
+    """
+    query = (payload.query or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query is required")
+
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+    user_id = principal_id if internal_key and principal_id else (payload.user_id or settings.memory_user_id)
+    mode_info = _normalize_search_mode(payload.search_mode)
+    model = (payload.model or settings.primary_model).strip()
+    thread_id = f"thread_{uuid.uuid4().hex}"
+    set_thread_owner(thread_id, principal_id or "anonymous")
+
+    async def _sse_generator():
+        gauge = None
+        try:
+            gauge = sse_active_connections.labels("research_sse")
+            gauge.inc()
+        except Exception:
+            gauge = None
+
+        try:
+            seq = 0
+            # Hint clients (EventSource) how long to wait before attempting reconnects.
+            try:
+                if await request.is_disconnected():
+                    return
+            except Exception:
+                pass
+            yield format_sse_retry(2000)
+
+            # Deterministic failure mode when no API key is configured.
+            # We keep this fast and side-effect free (no graph compilation/run).
+            if not (settings.openai_api_key or "").strip():
+                seq += 1
+                yield format_sse_event(
+                    event="error",
+                    data={"message": "OPENAI_API_KEY is not configured", "thread_id": thread_id},
+                    event_id=seq,
+                )
+                seq += 1
+                yield format_sse_event(event="done", data={"thread_id": thread_id}, event_id=seq)
+                return
+
+            source = iter_with_sse_keepalive(
+                stream_agent_events(
+                    query,
+                    thread_id=thread_id,
+                    model=model,
+                    search_mode=mode_info,
+                    agent_id=payload.agent_id,
+                    images=_normalize_images_payload(payload.images),
+                    user_id=user_id,
+                ),
+                interval_s=15.0,
+            )
+
+            async for maybe_line in iter_abort_on_disconnect(
+                source,
+                is_disconnected=request.is_disconnected,
+                check_interval_s=0.25,
+            ):
+                # Keepalive comments are already SSE frames.
+                if maybe_line.startswith(":"):
+                    yield maybe_line
+                    continue
+
+                seq += 1
+                sse = translate_legacy_line_to_sse(maybe_line, seq=seq)
+                if sse:
+                    yield sse
+        finally:
+            try:
+                if gauge is not None:
+                    gauge.dec()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        _sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "X-Thread-ID": thread_id,
+        },
+    )
+
+
+# ==================== Screenshot API ====================
+
+from fastapi.responses import FileResponse
+
+
+@app.get("/api/screenshots/{filename}")
+async def get_screenshot(filename: str):
+    """
+    Serve a screenshot file.
+
+    Args:
+        filename: Screenshot filename
+    """
+    service = get_screenshot_service()
+    filepath = service.get_screenshot_path(filename)
+
+    if not filepath:
+        raise HTTPException(status_code=404, detail="Screenshot not found")
+
+    # Determine media type
+    media_type = "image/png"
+    if filename.lower().endswith(".jpg") or filename.lower().endswith(".jpeg"):
+        media_type = "image/jpeg"
+
+    return FileResponse(
+        filepath, media_type=media_type, headers={"Cache-Control": "public, max-age=3600"}
+    )
+
+
+@app.get("/api/screenshots")
+async def list_screenshots(request: Request, thread_id: Optional[str] = None, limit: int = 50):
+    """
+    List available screenshots.
+
+    Args:
+        thread_id: Optional filter by thread ID
+        limit: Maximum number of results
+    """
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    if internal_key:
+        if not thread_id or not str(thread_id).strip():
+            raise HTTPException(status_code=400, detail="thread_id is required")
+        _require_thread_owner(request, str(thread_id))
+
+    service = get_screenshot_service()
+    screenshots = service.list_screenshots(thread_id=thread_id, limit=limit)
+
+    return {"screenshots": screenshots, "count": len(screenshots), "thread_id": thread_id}
+
+
+@app.post("/api/screenshots/cleanup")
+async def cleanup_screenshots():
+    """Cleanup old screenshots."""
+    service = get_screenshot_service()
+    deleted_count = await service.cleanup_old_screenshots()
+
+    return {
+        "status": "completed",
+        "deleted_count": deleted_count,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+# ==================== Tool Events SSE Endpoint ====================
+
+
+@app.get("/api/events/{thread_id}")
+async def stream_tool_events(thread_id: str, request: Request, last_event_id: Optional[str] = None):
+    """
+    Subscribe to tool execution events for a specific thread.
+
+    This endpoint streams real-time events including:
+    - tool_start: When a tool begins execution
+    - tool_screenshot: When a screenshot is captured
+    - tool_result: When a tool completes execution
+    - task_update: Task progress updates
+
+    Usage:
+        const eventSource = new EventSource('/api/events/thread_123');
+        eventSource.onmessage = (e) => {
+            const data = JSON.parse(e.data);
+            console.log(data.type, data.data);
+        };
+    """
+    _require_thread_owner(request, thread_id)
+
+    async def event_generator():
+        def _as_message_event(frame: str) -> str:
+            """
+            Frontend compatibility: emit *message* events only.
+
+            The v0.4 frontend uses `EventSource.onmessage`, which only receives
+            events with the default type ("message"). If we include an explicit
+            `event:` field (e.g. `event: tool_start`), the browser will dispatch
+            it as a *named* event and `onmessage` will not fire.
+
+            Our internal emitter uses typed SSE events; this endpoint strips the
+            `event:` line while keeping `id:` + `data:` so the client still gets
+            resume cursors via `lastEventId`.
+            """
+            if not frame:
+                return frame
+            # Keep comments/keepalives unchanged.
+            if frame.lstrip().startswith(":"):
+                return frame
+
+            lines: list[str] = []
+            for line in frame.splitlines():
+                if line.startswith("event:"):
+                    continue
+                lines.append(line)
+
+            return "\n".join(lines).rstrip("\n") + "\n\n"
+
+        gauge = None
+        try:
+            gauge = sse_active_connections.labels("tool_events")
+            gauge.inc()
+        except Exception:
+            gauge = None
+
+        cursor = last_event_id or request.headers.get("last-event-id")
+        try:
+            async for event_sse in event_stream_generator(
+                thread_id, timeout=300.0, last_event_id=cursor
+            ):
+                yield _as_message_event(event_sse)
+        finally:
+            try:
+                if gauge is not None:
+                    gauge.dec()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ==================== Browser Session Endpoints ====================
+
+_BROWSER_CLOSED_ERROR_FRAGMENTS = (
+    "TargetClosedError",
+    "Target page, context or browser has been closed",
+    "browser has been closed",
+    "Browser has been closed",
+    "Browser closed",
+    "Playwright connection closed",
+)
+
+
+def _looks_like_browser_closed_error(err: Exception) -> bool:
+    msg = str(err) or ""
+    return any(fragment in msg for fragment in _BROWSER_CLOSED_ERROR_FRAGMENTS)
+
+
+@app.get("/api/browser/{thread_id}/info")
+async def get_browser_session_info(thread_id: str, request: Request):
+    """
+    Get browser session information including CDP endpoint.
+
+    Returns browser session status and capabilities for real-time viewing.
+    """
+    _require_thread_owner(request, thread_id)
+
+    result = {
+        "active": False,
+        "thread_id": thread_id,
+        "mode": None,
+        "cdp_endpoint": None,
+        "current_url": None,
+    }
+
+    # Check sandbox browser session first.
+    #
+    # Important: this endpoint should be *fast* and must not create a sandbox
+    # as a side-effect (cold-starting E2B can take tens of seconds). The live
+    # stream WS endpoint is responsible for starting a session when needed.
+    try:
+        info = await sandbox_browser_sessions.run_async(
+            thread_id,
+            lambda: sandbox_browser_sessions.get(thread_id).peek_info(),
+        )
+        if info and isinstance(info, dict):
+            result["active"] = True
+            result["mode"] = "e2b"
+            result["cdp_endpoint"] = info.get("cdp_endpoint")
+    except Exception:
+        pass
+
+    # Check local browser session if sandbox not found
+    if not result["active"]:
+        try:
+            session = browser_sessions.get(thread_id)
+            if session and session.current:
+                result["active"] = True
+                result["mode"] = "local"
+                result["current_url"] = session.current.url
+        except Exception:
+            pass
+
+    return result
+
+
+@app.post("/api/browser/{thread_id}/screenshot")
+async def trigger_browser_screenshot(thread_id: str, request: Request):
+    """
+    Trigger a manual screenshot capture for the browser session.
+    """
+    _require_thread_owner(request, thread_id)
+
+    # Avoid cold-starting a sandbox here: manual screenshots should only be
+    # available once a live session already exists (e.g. via the WS viewer or
+    # a tool that opened a browser). This keeps the endpoint responsive.
+    try:
+        sandbox_active = await sandbox_browser_sessions.run_async(
+            thread_id,
+            lambda: sandbox_browser_sessions.get(thread_id).is_active(),
+        )
+    except Exception:
+        sandbox_active = False
+
+    if not sandbox_active:
+        return {"success": False, "error": "No active browser session"}
+
+    # Try sandbox browser first
+    try:
+
+        def _capture():
+            session = sandbox_browser_sessions.get(thread_id)
+            page = session.get_page()
+            try:
+                png_bytes = page.screenshot(full_page=True, animations="disabled", caret="hide")
+            except TypeError:
+                png_bytes = page.screenshot(full_page=True)
+            page_url = None
+            try:
+                page_url = page.url if page else None
+            except Exception:
+                page_url = None
+            return png_bytes, page_url
+
+        try:
+            png_bytes, page_url = await sandbox_browser_sessions.run_async(thread_id, _capture)
+        except Exception as e:
+            if not _looks_like_browser_closed_error(e):
+                raise
+            # Session got closed (common after some sites); reset and retry once.
+            try:
+                await sandbox_browser_sessions.run_async(
+                    thread_id, lambda: sandbox_browser_sessions.get(thread_id).close()
+                )
+            except Exception:
+                pass
+            png_bytes, page_url = await sandbox_browser_sessions.run_async(thread_id, _capture)
+
+        # Save screenshot
+        service = get_screenshot_service()
+        save_result = await service.save_screenshot(
+            image_data=png_bytes,
+            action="manual",
+            thread_id=thread_id,
+            page_url=page_url,
+        )
+
+        # Emit screenshot event
+        emitter = await get_emitter(thread_id)
+        await emitter.emit(
+            "tool_screenshot",
+            {
+                "tool": "manual",
+                "action": "manual",
+                "url": save_result.get("url"),
+                "filename": save_result.get("filename"),
+                "mime_type": save_result.get("mime_type"),
+                "page_url": page_url,
+            },
+        )
+
+        return {
+            "success": True,
+            "screenshot_url": save_result.get("url"),
+            "filename": save_result.get("filename"),
+        }
+    except Exception as e:
+        logger.error(f"Failed to capture screenshot: {e}")
+
+    return {"success": False, "error": "No active browser session"}
+
+
+@app.websocket("/api/browser/{thread_id}/stream")
+async def browser_stream_websocket(websocket: WebSocket, thread_id: str):
+    """
+    WebSocket endpoint for real-time browser frame streaming.
+
+    Uses periodic Playwright screenshots (~5 FPS by default).
+    Frames are sent as base64-encoded JPEG images.
+
+    Message format:
+        Incoming: {"action": "start" | "stop" | "capture"}
+        Outgoing: {"type": "frame", "data": "<base64>", "timestamp": <float>}
+                  {"type": "status", "message": "..."}
+                  {"type": "error", "message": "..."}
+    """
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    if internal_key:
+        auth_user_header = (getattr(settings, "auth_user_header", "") or "").strip() or "X-Weaver-User"
+        principal_id = (websocket.headers.get(auth_user_header) or "").strip()
+
+        provided = ""
+        auth_header = (websocket.headers.get("Authorization") or "").strip()
+        if auth_header.lower().startswith("bearer "):
+            provided = auth_header[7:].strip()
+        if not provided:
+            provided = (websocket.headers.get("X-API-Key") or "").strip()
+
+        if not provided or not hmac.compare_digest(provided, internal_key):
+            await websocket.close(code=4401)
+            return
+
+        if not principal_id:
+            await websocket.close(code=4403)
+            return
+
+        owner_id = (get_thread_owner(thread_id) or "").strip()
+        if owner_id and owner_id != principal_id:
+            await websocket.close(code=4403)
+            return
+
+        if checkpointer:
+            try:
+                from common.session_manager import get_session_manager
+
+                manager = get_session_manager(checkpointer)
+                session_state = manager.get_session_state(thread_id)
+                if session_state and isinstance(session_state.state, dict):
+                    persisted_owner = session_state.state.get("user_id")
+                    if (
+                        isinstance(persisted_owner, str)
+                        and persisted_owner.strip()
+                        and persisted_owner.strip() != principal_id
+                    ):
+                        await websocket.close(code=4403)
+                        return
+            except Exception:
+                pass
+
+    await websocket.accept()
+
+    ws_gauge = None
+    try:
+        ws_gauge = ws_active_connections.labels("browser_stream")
+        ws_gauge.inc()
+    except Exception:
+        ws_gauge = None
+
+    _browser_stream_conn_inc(thread_id)
+
+    streaming = False
+    stream_task: Optional[asyncio.Task] = None
+    init_task: Optional[asyncio.Task] = None
+    ping_task: Optional[asyncio.Task] = None
+    dropped_messages = 0
+
+    async def _safe_send_json(payload: Dict[str, Any], *, timeout_s: Optional[float] = None) -> bool:
+        """
+        Best-effort send that won't spam logs on expected disconnects.
+
+        Playwright streaming runs in a background task; it's normal for clients
+        (e.g. Playwright e2e) to close the socket while the server is mid-send.
+        """
+        nonlocal dropped_messages
+        try:
+            send_coro = websocket.send_json(payload)
+            if timeout_s is not None and float(timeout_s) > 0:
+                await asyncio.wait_for(send_coro, timeout=float(timeout_s))
+            else:
+                await send_coro
+            return True
+        except asyncio.TimeoutError:
+            # Backpressure: drop the message but keep the connection alive.
+            dropped_messages += 1
+            try:
+                browser_ws_dropped_messages_total.labels("browser_stream").inc()
+            except Exception:
+                pass
+            return True
+        except WebSocketDisconnect:
+            return False
+        except RuntimeError:
+            # Starlette can raise RuntimeError when sending after close.
+            return False
+
+    async def _ping_loop() -> None:
+        """
+        Keep the WS connection warm behind proxies/load balancers.
+
+        The client is allowed to ignore this message.
+        """
+        while True:
+            await asyncio.sleep(15.0)
+            ok = await _safe_send_json({"type": "ping", "timestamp": time.time()}, timeout_s=1.0)
+            if not ok:
+                break
+
+    def _render_live_status_html(*, title: str, detail: str) -> str:
+        safe_title = (title or "").strip()[:120]
+        safe_detail = (detail or "").strip()[:240]
+        return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Weaver</title>
+    <style>
+      :root {{ color-scheme: light; }}
+      body {{
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+        background: radial-gradient(80% 120% at 10% 10%, #f5f5f4 0%, #ffffff 55%, #fafaf9 100%);
+        color: #1c1917;
+      }}
+      .wrap {{ min-height: 100vh; display: grid; place-items: center; padding: 32px; }}
+      .card {{
+        width: min(720px, 92vw);
+        background: rgba(255, 255, 255, 0.82);
+        border: 1px solid rgba(0, 0, 0, 0.06);
+        border-radius: 16px;
+        box-shadow: 0 18px 60px rgba(0, 0, 0, 0.08);
+        padding: 18px 18px 16px 18px;
+      }}
+      .row {{ display: flex; align-items: center; gap: 12px; }}
+      .spinner {{
+        width: 18px; height: 18px; border-radius: 999px;
+        border: 2px solid rgba(0,0,0,0.12);
+        border-top-color: rgba(16,185,129,0.9);
+        animation: spin 0.9s linear infinite;
+      }}
+      @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+      .title {{ font-size: 14px; font-weight: 600; letter-spacing: 0.2px; }}
+      .detail {{
+        margin-top: 8px;
+        font-size: 12px;
+        color: rgba(41, 37, 36, 0.70);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }}
+      .bar {{
+        margin-top: 12px;
+        height: 6px;
+        width: 100%;
+        background: rgba(0,0,0,0.06);
+        border-radius: 999px;
+        overflow: hidden;
+      }}
+      .bar > div {{
+        height: 100%;
+        width: 45%;
+        background: linear-gradient(90deg, rgba(16,185,129,0.25), rgba(16,185,129,0.9));
+        animation: slide 1.4s ease-in-out infinite;
+        border-radius: 999px;
+      }}
+      @keyframes slide {{
+        0% {{ transform: translateX(-20%); opacity: 0.5; }}
+        50% {{ transform: translateX(90%); opacity: 1; }}
+        100% {{ transform: translateX(220%); opacity: 0.5; }}
+      }}
+      .hint {{ margin-top: 10px; font-size: 11px; color: rgba(41, 37, 36, 0.55); }}
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <div class="row">
+          <div class="spinner" aria-hidden="true"></div>
+          <div class="title">{safe_title}</div>
+        </div>
+        <div class="detail">{safe_detail}</div>
+        <div class="bar"><div></div></div>
+        <div class="hint">Weaver sandbox browser · live preview</div>
+      </div>
+    </div>
+  </body>
+</html>
+"""
+
+    def _maybe_set_live_status_page(page: Any) -> None:
+        """
+        Ensure `about:blank` isn't a misleading empty white frame.
+
+        A simple status page makes the viewer feel responsive during sandbox
+        cold-starts, and also triggers a paint so CDP screencast has something
+        non-empty to capture.
+        """
+        try:
+            current_url = str(getattr(page, "url", "") or "").strip().lower()
+        except Exception:
+            current_url = ""
+
+        if current_url.startswith("http://") or current_url.startswith("https://"):
+            return
+
+        try:
+            existing_title = str(page.title() or "").strip().lower()
+        except Exception:
+            existing_title = ""
+        if existing_title.startswith("weaver"):
+            return
+
+        html = _render_live_status_html(
+            title="Live view ready",
+            detail="Waiting for browser activity…",
+        )
+        page.set_content(html)
+
+    async def capture_frame(*, quality: int = 70) -> Dict[str, Any]:
+        """Capture a single JPEG frame from the sandbox browser session."""
+        q = max(1, min(100, int(quality or 70)))
+        capture_timeout_s = 90.0
+
+        async def _run_capture():
+            try:
+                return await asyncio.wait_for(
+                    sandbox_browser_sessions.run_async(thread_id, _capture), timeout=capture_timeout_s
+                )
+            except asyncio.TimeoutError as e:
+                raise TimeoutError(
+                    "Timed out waiting for sandbox browser frame. "
+                    "The sandbox may be cold-starting or stuck. "
+                    "Check GET /api/sandbox/browser/diagnose (and ?deep=1), then retry."
+                ) from e
+
+        def _capture():
+            session = sandbox_browser_sessions.get(thread_id)
+            page = session.get_page()
+            try:
+                _maybe_set_live_status_page(page)
+            except Exception:
+                pass
+            try:
+                # Live streaming should preserve animations so the viewer can
+                # actually reflect motion between frames.
+                jpg_bytes = page.screenshot(type="jpeg", quality=q, full_page=False, caret="hide")
+            except TypeError:
+                jpg_bytes = page.screenshot(type="jpeg", quality=q, full_page=False)
+            metadata: Dict[str, Any] = {}
+            try:
+                metadata["url"] = page.url
+            except Exception:
+                pass
+            try:
+                metadata["title"] = page.title() or ""
+            except Exception:
+                pass
+            try:
+                session.set_page_meta(url=metadata.get("url"), title=metadata.get("title"))
+            except Exception:
+                pass
+            return jpg_bytes, metadata
+
+        try:
+            jpg_bytes, metadata = await _run_capture()
+        except Exception as e:
+            if not _looks_like_browser_closed_error(e):
+                raise
+            # Session got closed; reset and retry once.
+            try:
+                await sandbox_browser_sessions.run_async(
+                    thread_id, lambda: sandbox_browser_sessions.get(thread_id).close()
+                )
+            except Exception:
+                pass
+            jpg_bytes, metadata = await _run_capture()
+        return {
+            "data": base64.b64encode(jpg_bytes).decode("ascii"),
+            "metadata": metadata,
+        }
+
+    async def _start_cdp_screencast(*, quality: int) -> bool:
+        def _start():
+            session = sandbox_browser_sessions.get(thread_id)
+            return session.start_screencast(
+                quality=int(quality or 70),
+                max_width=1280,
+                max_height=720,
+                format="jpeg",
+            )
+
+        try:
+            return bool(await sandbox_browser_sessions.run_async(thread_id, _start))
+        except Exception:
+            return False
+
+    async def _stop_cdp_screencast() -> None:
+        def _stop():
+            session = sandbox_browser_sessions.get(thread_id)
+            session.stop_screencast()
+
+        try:
+            await sandbox_browser_sessions.run_async(thread_id, _stop)
+        except Exception:
+            pass
+
+    def _peek_cdp_frame() -> Optional[Dict[str, Any]]:
+        """
+        Peek the latest CDP frame without touching Playwright.
+
+        This is intentionally synchronous and avoids the Playwright executor so
+        the WS stream stays responsive even while navigation/tool calls are
+        running on the browser thread.
+        """
+        try:
+            return sandbox_browser_sessions.peek_screencast_frame(thread_id)
+        except Exception:
+            return None
+
+    async def stream_frames(*, quality: int, max_fps: int):
+        nonlocal streaming, init_task
+        interval = 1.0 / max(1, int(max_fps or 5))
+        next_frame_due = time.perf_counter()
+        last_frame_payload: Optional[Dict[str, Any]] = None
+        last_screenshot_capture_at: float = 0.0
+        screenshot_refresh_s = 1.0
+        consecutive_failures = 0
+        max_failures = 5
+        frame_send_timeout_s = 1.0
+        while streaming:
+            try:
+                now_perf = time.perf_counter()
+                if now_perf < next_frame_due:
+                    await asyncio.sleep(next_frame_due - now_perf)
+
+                # Prefer CDP screencast frames (smooth, low overhead). Fall back to screenshots.
+                cdp_frame = _peek_cdp_frame()
+                if cdp_frame and cdp_frame.get("data"):
+                    now = time.time()
+                    try:
+                        browser_ws_frames_total.labels("cdp").inc()
+                    except Exception:
+                        pass
+                    payload = {
+                        "type": "frame",
+                        "source": "cdp",
+                        "data": cdp_frame["data"],
+                        "timestamp": float(cdp_frame.get("timestamp") or now),
+                        "metadata": cdp_frame.get("metadata") or {},
+                    }
+                    if not await _safe_send_json(payload, timeout_s=frame_send_timeout_s):
+                        streaming = False
+                        break
+                    last_frame_payload = payload
+                else:
+                    now = time.time()
+                    should_capture = (
+                        last_frame_payload is None
+                        or last_frame_payload.get("source") != "screenshot"
+                        or (now - last_screenshot_capture_at) >= screenshot_refresh_s
+                    )
+
+                    if should_capture:
+                        frame = await capture_frame(quality=quality)
+                        payload = {
+                            "type": "frame",
+                            "source": "screenshot",
+                            "data": frame["data"],
+                            "timestamp": now,
+                            "metadata": frame.get("metadata") or {},
+                        }
+                        last_frame_payload = payload
+                        last_screenshot_capture_at = now
+                    else:
+                        payload = dict(last_frame_payload)
+                        payload["timestamp"] = now
+
+                    try:
+                        browser_ws_frames_total.labels("screenshot").inc()
+                    except Exception:
+                        pass
+                    if not await _safe_send_json(payload, timeout_s=frame_send_timeout_s):
+                        streaming = False
+                        break
+                    last_frame_payload = payload
+                consecutive_failures = 0
+            except Exception as e:
+                consecutive_failures += 1
+                if isinstance(e, TimeoutError) and last_frame_payload is None:
+                    # Special-case startup timeouts: don't leave the UI stuck in "LIVE" with
+                    # zero frames. Stop immediately with an actionable error.
+                    streaming = False
+                    if init_task:
+                        init_task.cancel()
+                        init_task = None
+                    await _stop_cdp_screencast()
+                    await _safe_send_json(
+                        {
+                            "type": "error",
+                            "message": str(e),
+                            "hint": (
+                                "If this happens repeatedly, verify your sandbox config and dependencies via "
+                                "GET /api/sandbox/browser/diagnose?deep=1."
+                            ),
+                        },
+                        timeout_s=1.0,
+                    )
+                    await _safe_send_json(
+                        {
+                            "type": "status",
+                            "message": "Screencast stopped",
+                            "reason": "startup_timeout",
+                        },
+                        timeout_s=1.0,
+                    )
+                    break
+                await _safe_send_json(
+                    {
+                        "type": "error",
+                        "message": f"Capture failed: {e}",
+                        "consecutive_failures": consecutive_failures,
+                    },
+                    timeout_s=1.0,
+                )
+                if consecutive_failures >= max_failures:
+                    # The stream is unhealthy; stop the screencast so the frontend
+                    # doesn't stay stuck in "LIVE" while frames are no longer flowing.
+                    streaming = False
+                    if init_task:
+                        init_task.cancel()
+                        init_task = None
+                    await _stop_cdp_screencast()
+                    await _safe_send_json(
+                        {
+                            "type": "error",
+                            "message": (
+                                "Browser stream stopped after consecutive capture failures. "
+                                f"Last error: {e}"
+                            ),
+                            "consecutive_failures": consecutive_failures,
+                            "hint": (
+                                "Check GET /api/sandbox/browser/diagnose (and ?deep=1) for "
+                                "missing config/dependencies, then retry."
+                            ),
+                        },
+                        timeout_s=1.0,
+                    )
+                    await _safe_send_json(
+                        {
+                            "type": "status",
+                            "message": "Screencast stopped",
+                            "reason": "capture_failed",
+                            "consecutive_failures": consecutive_failures,
+                        },
+                        timeout_s=1.0,
+                    )
+                    break
+                # Exponential backoff to avoid a tight error loop when the sandbox/browser is unhealthy.
+                backoff_s = min(2.0, 0.25 * (2 ** (consecutive_failures - 1)))
+                await asyncio.sleep(backoff_s)
+                next_frame_due = time.perf_counter() + interval
+                continue
+            next_frame_due = max(next_frame_due + interval, time.perf_counter())
+
+    try:
+        await _safe_send_json(
+            {
+                "type": "status",
+                "message": "Connected to browser stream",
+                "thread_id": thread_id,
+                "mode": "e2b",
+                "streaming": False,
+            }
+        )
+
+        ping_task = asyncio.create_task(_ping_loop(), name=f"weaver-browser-ws-ping-{thread_id}")
+
+        while True:
+            try:
+                data = await websocket.receive_json()
+                action = data.get("action", "")
+                req_id = None
+                try:
+                    raw_id = data.get("id")
+                    if raw_id is not None:
+                        req_id = str(raw_id).strip() or None
+                except Exception:
+                    req_id = None
+
+                async def _send_ack(
+                    *,
+                    ok: bool,
+                    action_name: str,
+                    error: str | None = None,
+                    metadata: Optional[Dict[str, Any]] = None,
+                    req_id=req_id,
+                ) -> bool:
+                    payload: Dict[str, Any] = {
+                        "type": "ack",
+                        "ok": bool(ok),
+                        "action": action_name,
+                        "timestamp": time.time(),
+                    }
+                    if req_id:
+                        payload["id"] = req_id
+                    if error:
+                        payload["error"] = str(error)
+                    if isinstance(metadata, dict) and metadata:
+                        payload["metadata"] = metadata
+                    return await _safe_send_json(payload, timeout_s=1.0)
+
+                if action == "start":
+                    if streaming:
+                        await _safe_send_json(
+                            {
+                                "type": "status",
+                                "message": "Screencast already running",
+                            }
+                        )
+                        continue
+
+                    quality = data.get("quality", 70)
+                    max_fps = data.get("max_fps", 5)
+                    quality_int = int(quality or 70)
+                    max_fps_int = int(max_fps or 5)
+
+                    # If sandbox browser isn't configured, fail fast with an actionable message
+                    # (avoid starting a stream task that will just spam "Capture failed").
+                    try:
+                        import os
+
+                        missing_cfg: list[str] = []
+                        if not (settings.e2b_api_key or "").strip():
+                            missing_cfg.append("E2B_API_KEY")
+                        template = (
+                            os.getenv("SANDBOX_TEMPLATE_BROWSER")
+                            or (settings.sandbox_template_browser or "")
+                        ).strip()
+                        if not template:
+                            missing_cfg.append("SANDBOX_TEMPLATE_BROWSER")
+
+                        if missing_cfg:
+                            await _safe_send_json(
+                                {
+                                    "type": "error",
+                                    "message": "Sandbox browser is not configured",
+                                    "missing": missing_cfg,
+                                    "hint": "Set E2B_API_KEY and SANDBOX_TEMPLATE_BROWSER in .env, then retry.",
+                                }
+                            )
+                            continue
+                    except Exception:
+                        # Best-effort only; never block stream start on diagnose errors.
+                        pass
+
+                    # The sandbox browser starts at `about:blank`, which produces an all-white
+                    # first frame. Render a lightweight animated status page before
+                    # starting the screencast so Chrome can capture an already-live page.
+                    def _set_status_page_if_blank():
+                        session = sandbox_browser_sessions.get(thread_id)
+                        page = session.get_page()
+                        try:
+                            _maybe_set_live_status_page(page)
+                        except Exception:
+                            pass
+
+                        meta: Dict[str, Any] = {}
+                        try:
+                            meta["url"] = page.url
+                        except Exception:
+                            pass
+                        try:
+                            meta["title"] = page.title() or ""
+                        except Exception:
+                            pass
+                        try:
+                            session.set_page_meta(url=meta.get("url"), title=meta.get("title"))
+                        except Exception:
+                            pass
+                        return meta
+                    # Acknowledge the start immediately. Sandbox cold starts can be slow; the
+                    # client should not be stuck in "Starting live view..." while we initialize.
+                    streaming = True
+                    ok = await _safe_send_json(
+                        {
+                            "type": "status",
+                            "message": "Screencast started",
+                            "quality": quality_int,
+                            "max_fps": max_fps_int,
+                        }
+                    )
+                    if not ok:
+                        streaming = False
+                        break
+
+                    # Start the streaming loop after the start status so clients/tests observe
+                    # a stable ordering (status first, then frames/errors).
+                    stream_task = asyncio.create_task(
+                        stream_frames(quality=quality_int, max_fps=max_fps_int),
+                        name=f"weaver-browser-ws-stream-{thread_id}",
+                    )
+
+                    # Do not block start on sandbox initialization; run best-effort init in
+                    # the background. If CDP fails, the stream will fall back to screenshots.
+                    async def _init_screencast(q: int = quality_int) -> None:
+                        try:
+                            try:
+                                await asyncio.wait_for(
+                                    sandbox_browser_sessions.run_async(thread_id, _set_status_page_if_blank),
+                                    timeout=10.0,
+                                )
+                            except asyncio.TimeoutError:
+                                pass
+                            except Exception:
+                                pass
+
+                            try:
+                                await asyncio.wait_for(
+                                    _start_cdp_screencast(quality=q), timeout=120.0
+                                )
+                            except asyncio.TimeoutError:
+                                pass
+                            except Exception:
+                                pass
+                        except asyncio.CancelledError:
+                            raise
+
+                    init_task = asyncio.create_task(
+                        _init_screencast(), name=f"weaver-browser-ws-init-{thread_id}"
+                    )
+
+                elif action == "stop":
+                    streaming = False
+                    if stream_task:
+                        stream_task.cancel()
+                        stream_task = None
+                    if init_task:
+                        init_task.cancel()
+                        init_task = None
+                    await _stop_cdp_screencast()
+                    await _safe_send_json(
+                        {
+                            "type": "status",
+                            "message": "Screencast stopped",
+                        }
+                    )
+
+                elif action == "capture":
+                    try:
+                        # Fast-fail if sandbox config is missing (actionable error).
+                        try:
+                            import os
+
+                            missing_cfg: list[str] = []
+                            if not (settings.e2b_api_key or "").strip():
+                                missing_cfg.append("E2B_API_KEY")
+                            template = (
+                                os.getenv("SANDBOX_TEMPLATE_BROWSER")
+                                or (settings.sandbox_template_browser or "")
+                            ).strip()
+                            if not template:
+                                missing_cfg.append("SANDBOX_TEMPLATE_BROWSER")
+
+                            if missing_cfg:
+                                await _safe_send_json(
+                                    {
+                                        "type": "error",
+                                        "message": "Sandbox browser is not configured",
+                                        "missing": missing_cfg,
+                                        "hint": "Set E2B_API_KEY and SANDBOX_TEMPLATE_BROWSER in .env, then retry.",
+                                    }
+                                )
+                                continue
+                        except Exception:
+                            pass
+
+                        # If a CDP screencast is running, reuse its latest frame;
+                        # otherwise force a screenshot capture.
+                        frame_payload = _peek_cdp_frame()
+                        if frame_payload and frame_payload.get("data"):
+                            await _safe_send_json(
+                                {
+                                    "type": "frame",
+                                    "source": "cdp",
+                                    "data": frame_payload["data"],
+                                    "timestamp": float(frame_payload.get("timestamp") or time.time()),
+                                    "metadata": frame_payload.get("metadata") or {},
+                                }
+                            )
+                            continue
+
+                        frame = await capture_frame(quality=int(data.get("quality", 70) or 70))
+                        await _safe_send_json(
+                            {
+                                "type": "frame",
+                                "source": "screenshot",
+                                "data": frame["data"],
+                                "timestamp": time.time(),
+                                "metadata": frame.get("metadata") or {},
+                            }
+                        )
+                    except Exception as e:
+                        await _safe_send_json({"type": "error", "message": f"Capture failed: {e}"})
+
+                elif action == "mouse":
+                    mouse_type = str(data.get("type") or "").strip().lower()
+                    if mouse_type not in {"click", "move", "down", "up"}:
+                        ok = await _send_ack(
+                            ok=False,
+                            action_name="mouse",
+                            error=f"Unsupported mouse action type: {mouse_type or '(missing)'}",
+                        )
+                        if not ok:
+                            break
+                        continue
+
+                    button = str(data.get("button") or "left").strip().lower() or "left"
+                    if mouse_type in {"click", "move"}:
+                        try:
+                            x_norm = float(data.get("x"))
+                            y_norm = float(data.get("y"))
+                        except Exception:
+                            ok = await _send_ack(
+                                ok=False,
+                                action_name="mouse",
+                                error="Mouse click/move requires numeric x/y in [0..1].",
+                            )
+                            if not ok:
+                                break
+                            continue
+
+                        if not (0.0 <= x_norm <= 1.0 and 0.0 <= y_norm <= 1.0):
+                            ok = await _send_ack(
+                                ok=False,
+                                action_name="mouse",
+                                error="Mouse x/y must be between 0 and 1.",
+                            )
+                            if not ok:
+                                break
+                            continue
+
+                        def _resolve_viewport_size(page) -> tuple[int, int]:
+                            viewport = getattr(page, "viewport_size", None)
+                            width = None
+                            height = None
+                            if isinstance(viewport, dict):
+                                width = viewport.get("width")
+                                height = viewport.get("height")
+
+                            if not isinstance(width, (int, float)) or not isinstance(
+                                height, (int, float)
+                            ):
+                                try:
+                                    measured = page.evaluate(
+                                        "() => ({ w: window.innerWidth, h: window.innerHeight })"
+                                    )
+                                except Exception:
+                                    measured = None
+                                if isinstance(measured, dict):
+                                    width = measured.get("w") or measured.get("width")
+                                    height = measured.get("h") or measured.get("height")
+
+                            if not isinstance(width, (int, float)) or not isinstance(height, (int, float)):
+                                raise RuntimeError("Could not determine browser viewport size")
+                            if width <= 0 or height <= 0:
+                                raise RuntimeError("Invalid browser viewport size")
+
+                            return int(width), int(height)
+
+                        if mouse_type == "click":
+                            try:
+                                clicks = int(data.get("clicks", 1) or 1)
+                            except Exception:
+                                clicks = 1
+                            clicks = max(1, min(10, clicks))
+
+                            def _click(
+                                x_norm=x_norm,
+                                y_norm=y_norm,
+                                button=button,
+                                clicks=clicks,
+                            ):
+                                session = sandbox_browser_sessions.get(thread_id)
+                                page = session.get_page()
+                                width, height = _resolve_viewport_size(page)
+
+                                x_px = int(x_norm * float(width))
+                                y_px = int(y_norm * float(height))
+                                if x_px >= width:
+                                    x_px = width - 1
+                                if y_px >= height:
+                                    y_px = height - 1
+                                if x_px < 0:
+                                    x_px = 0
+                                if y_px < 0:
+                                    y_px = 0
+
+                                page.mouse.click(x_px, y_px, button=button, click_count=clicks)
+
+                                meta: Dict[str, Any] = {}
+                                try:
+                                    meta["url"] = page.url
+                                except Exception:
+                                    pass
+                                try:
+                                    meta["title"] = page.title() or ""
+                                except Exception:
+                                    pass
+                                try:
+                                    session.set_page_meta(url=meta.get("url"), title=meta.get("title"))
+                                except Exception:
+                                    pass
+                                return meta
+                            try:
+                                metadata = await sandbox_browser_sessions.run_async(thread_id, _click)
+                                ok = await _send_ack(ok=True, action_name="mouse", metadata=metadata)
+                                if not ok:
+                                    break
+                            except Exception as e:
+                                ok = await _send_ack(ok=False, action_name="mouse", error=str(e))
+                                if not ok:
+                                    break
+
+                        else:
+                            def _move(x_norm=x_norm, y_norm=y_norm):
+                                session = sandbox_browser_sessions.get(thread_id)
+                                page = session.get_page()
+                                width, height = _resolve_viewport_size(page)
+
+                                x_px = int(x_norm * float(width))
+                                y_px = int(y_norm * float(height))
+                                if x_px >= width:
+                                    x_px = width - 1
+                                if y_px >= height:
+                                    y_px = height - 1
+                                if x_px < 0:
+                                    x_px = 0
+                                if y_px < 0:
+                                    y_px = 0
+
+                                page.mouse.move(x_px, y_px)
+
+                                meta: Dict[str, Any] = {}
+                                try:
+                                    meta["url"] = page.url
+                                except Exception:
+                                    pass
+                                try:
+                                    meta["title"] = page.title() or ""
+                                except Exception:
+                                    pass
+                                try:
+                                    session.set_page_meta(url=meta.get("url"), title=meta.get("title"))
+                                except Exception:
+                                    pass
+                                return meta
+                            try:
+                                metadata = await sandbox_browser_sessions.run_async(thread_id, _move)
+                                ok = await _send_ack(ok=True, action_name="mouse", metadata=metadata)
+                                if not ok:
+                                    break
+                            except Exception as e:
+                                ok = await _send_ack(ok=False, action_name="mouse", error=str(e))
+                                if not ok:
+                                    break
+
+                    elif mouse_type == "down":
+                        def _down(button=button):
+                            session = sandbox_browser_sessions.get(thread_id)
+                            page = session.get_page()
+                            page.mouse.down(button=button)
+
+                            meta: Dict[str, Any] = {}
+                            try:
+                                meta["url"] = page.url
+                            except Exception:
+                                pass
+                            try:
+                                meta["title"] = page.title() or ""
+                            except Exception:
+                                pass
+                            try:
+                                session.set_page_meta(url=meta.get("url"), title=meta.get("title"))
+                            except Exception:
+                                pass
+                            return meta
+                        try:
+                            metadata = await sandbox_browser_sessions.run_async(thread_id, _down)
+                            ok = await _send_ack(ok=True, action_name="mouse", metadata=metadata)
+                            if not ok:
+                                break
+                        except Exception as e:
+                            ok = await _send_ack(ok=False, action_name="mouse", error=str(e))
+                            if not ok:
+                                break
+
+                    else:
+                        def _up(button=button):
+                            session = sandbox_browser_sessions.get(thread_id)
+                            page = session.get_page()
+                            page.mouse.up(button=button)
+
+                            meta: Dict[str, Any] = {}
+                            try:
+                                meta["url"] = page.url
+                            except Exception:
+                                pass
+                            try:
+                                meta["title"] = page.title() or ""
+                            except Exception:
+                                pass
+                            try:
+                                session.set_page_meta(url=meta.get("url"), title=meta.get("title"))
+                            except Exception:
+                                pass
+                            return meta
+                        try:
+                            metadata = await sandbox_browser_sessions.run_async(thread_id, _up)
+                            ok = await _send_ack(ok=True, action_name="mouse", metadata=metadata)
+                            if not ok:
+                                break
+                        except Exception as e:
+                            ok = await _send_ack(ok=False, action_name="mouse", error=str(e))
+                            if not ok:
+                                break
+
+                elif action == "scroll":
+                    try:
+                        dx = int(data.get("dx", 0) or 0)
+                        dy = int(data.get("dy", 0) or 0)
+                    except Exception:
+                        ok = await _send_ack(
+                            ok=False,
+                            action_name="scroll",
+                            error="Scroll requires integer dx/dy.",
+                        )
+                        if not ok:
+                            break
+                        continue
+
+                    def _wheel(dx=dx, dy=dy):
+                        session = sandbox_browser_sessions.get(thread_id)
+                        page = session.get_page()
+                        page.mouse.wheel(dx, dy)
+
+                        meta: Dict[str, Any] = {}
+                        try:
+                            meta["url"] = page.url
+                        except Exception:
+                            pass
+                        try:
+                            meta["title"] = page.title() or ""
+                        except Exception:
+                            pass
+                        try:
+                            session.set_page_meta(url=meta.get("url"), title=meta.get("title"))
+                        except Exception:
+                            pass
+                        return meta
+                    try:
+                        metadata = await sandbox_browser_sessions.run_async(thread_id, _wheel)
+                        ok = await _send_ack(ok=True, action_name="scroll", metadata=metadata)
+                        if not ok:
+                            break
+                    except Exception as e:
+                        ok = await _send_ack(ok=False, action_name="scroll", error=str(e))
+                        if not ok:
+                            break
+
+                elif action == "keyboard":
+                    key_type = str(data.get("type") or "").strip().lower()
+                    if key_type not in {"press", "type"}:
+                        ok = await _send_ack(
+                            ok=False,
+                            action_name="keyboard",
+                            error=f"Unsupported keyboard action type: {key_type or '(missing)'}",
+                        )
+                        if not ok:
+                            break
+                        continue
+
+                    if key_type == "press":
+                        key = str(data.get("key") or "").strip()
+                        if not key:
+                            ok = await _send_ack(
+                                ok=False,
+                                action_name="keyboard",
+                                error="Keyboard press requires a non-empty key.",
+                            )
+                            if not ok:
+                                break
+                            continue
+
+                        def _press(key=key):
+                            session = sandbox_browser_sessions.get(thread_id)
+                            page = session.get_page()
+                            page.keyboard.press(key)
+
+                            meta: Dict[str, Any] = {}
+                            try:
+                                meta["url"] = page.url
+                            except Exception:
+                                pass
+                            try:
+                                meta["title"] = page.title() or ""
+                            except Exception:
+                                pass
+                            try:
+                                session.set_page_meta(url=meta.get("url"), title=meta.get("title"))
+                            except Exception:
+                                pass
+                            return meta
+                        try:
+                            metadata = await sandbox_browser_sessions.run_async(thread_id, _press)
+                            ok = await _send_ack(ok=True, action_name="keyboard", metadata=metadata)
+                            if not ok:
+                                break
+                        except Exception as e:
+                            ok = await _send_ack(ok=False, action_name="keyboard", error=str(e))
+                            if not ok:
+                                break
+
+                    else:
+                        text = str(data.get("text") or "")
+                        if not text:
+                            ok = await _send_ack(
+                                ok=False,
+                                action_name="keyboard",
+                                error="Keyboard type requires a non-empty text.",
+                            )
+                            if not ok:
+                                break
+                            continue
+
+                        def _type(text=text):
+                            session = sandbox_browser_sessions.get(thread_id)
+                            page = session.get_page()
+                            page.keyboard.type(text)
+
+                            meta: Dict[str, Any] = {}
+                            try:
+                                meta["url"] = page.url
+                            except Exception:
+                                pass
+                            try:
+                                meta["title"] = page.title() or ""
+                            except Exception:
+                                pass
+                            try:
+                                session.set_page_meta(url=meta.get("url"), title=meta.get("title"))
+                            except Exception:
+                                pass
+                            return meta
+                        try:
+                            metadata = await sandbox_browser_sessions.run_async(thread_id, _type)
+                            ok = await _send_ack(ok=True, action_name="keyboard", metadata=metadata)
+                            if not ok:
+                                break
+                        except Exception as e:
+                            ok = await _send_ack(ok=False, action_name="keyboard", error=str(e))
+                            if not ok:
+                                break
+
+                elif action == "navigate":
+                    url = str(data.get("url") or "").strip()
+                    if not url:
+                        ok = await _send_ack(
+                            ok=False,
+                            action_name="navigate",
+                            error="Navigate requires a non-empty url.",
+                        )
+                        if not ok:
+                            break
+                        continue
+
+                    try:
+                        from urllib.parse import urlsplit
+
+                        parsed = urlsplit(url)
+                    except Exception:
+                        parsed = None
+
+                    if not parsed or parsed.scheme.lower() not in {"http", "https"}:
+                        ok = await _send_ack(
+                            ok=False,
+                            action_name="navigate",
+                            error="Only http(s) URLs are allowed.",
+                        )
+                        if not ok:
+                            break
+                        continue
+
+                    if not parsed.netloc:
+                        ok = await _send_ack(
+                            ok=False,
+                            action_name="navigate",
+                            error="Navigate URL must include a host.",
+                        )
+                        if not ok:
+                            break
+                        continue
+
+                    def _goto(url=url):
+                        session = sandbox_browser_sessions.get(thread_id)
+                        page = session.get_page()
+                        page.goto(url)
+
+                        meta: Dict[str, Any] = {}
+                        try:
+                            meta["url"] = page.url
+                        except Exception:
+                            pass
+                        try:
+                            meta["title"] = page.title() or ""
+                        except Exception:
+                            pass
+                        try:
+                            session.set_page_meta(url=meta.get("url"), title=meta.get("title"))
+                        except Exception:
+                            pass
+                        return meta
+                    try:
+                        metadata = await sandbox_browser_sessions.run_async(thread_id, _goto)
+                        ok = await _send_ack(ok=True, action_name="navigate", metadata=metadata)
+                        if not ok:
+                            break
+                    except Exception as e:
+                        ok = await _send_ack(ok=False, action_name="navigate", error=str(e))
+                        if not ok:
+                            break
+                else:
+                    try:
+                        action_name = str(action or "").strip()
+                    except Exception:
+                        action_name = ""
+                    if not action_name:
+                        action_name = "unknown"
+                    ok = await _send_ack(
+                        ok=False,
+                        action_name=action_name,
+                        error=f"Unsupported action: {action_name}",
+                    )
+                    if not ok:
+                        break
+
+            except WebSocketDisconnect:
+                break
+            except RuntimeError as e:
+                # Starlette may raise RuntimeError on receive/send after the socket is closed.
+                # Treat this as a normal disconnect to avoid a tight error loop.
+                msg = str(e).lower()
+                if "websocket is not connected" in msg or ("need to call" in msg and "accept" in msg):
+                    break
+                logger.error(f"WebSocket runtime error: {e}")
+                await _safe_send_json({"type": "error", "message": str(e)})
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}")
+                await _safe_send_json({"type": "error", "message": str(e)})
+
+    finally:
+        streaming = False
+        if stream_task:
+            stream_task.cancel()
+        if init_task:
+            init_task.cancel()
+        if ping_task:
+            ping_task.cancel()
+        await _stop_cdp_screencast()
+        _browser_stream_conn_dec(thread_id)
+        try:
+            if ws_gauge is not None:
+                ws_gauge.dec()
+        except Exception:
+            pass
+        logger.info(f"Browser stream WebSocket closed for thread {thread_id}")
+
+
+# ==================== Trigger System Endpoints ====================
+
+
+class CreateScheduledTriggerRequest(BaseModel):
+    name: str
+    description: str = ""
+    schedule: str  # Cron expression
+    agent_id: str = "default"
+    task: str
+    task_params: Dict[str, Any] = {}
+    timezone: str = "Asia/Shanghai"
+    run_immediately: bool = False
+    user_id: Optional[str] = None
+    tags: List[str] = []
+
+
+class CreateWebhookTriggerRequest(BaseModel):
+    name: str
+    description: str = ""
+    agent_id: str = "default"
+    task: str
+    task_params: Dict[str, Any] = {}
+    http_methods: List[str] = ["POST"]
+    require_auth: bool = False
+    rate_limit: Optional[int] = None
+    user_id: Optional[str] = None
+    tags: List[str] = []
+
+
+class CreateEventTriggerRequest(BaseModel):
+    name: str
+    description: str = ""
+    event_type: str
+    event_source: Optional[str] = None
+    event_filters: Dict[str, Any] = {}
+    agent_id: str = "default"
+    task: str
+    task_params: Dict[str, Any] = {}
+    debounce_seconds: int = 0
+    user_id: Optional[str] = None
+    tags: List[str] = []
+
+
+@app.post("/api/triggers/scheduled")
+async def create_scheduled_trigger(request: Request, payload: CreateScheduledTriggerRequest):
+    """Create a new scheduled trigger with cron expression."""
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+    trigger = ScheduledTrigger(
+        name=payload.name,
+        description=payload.description,
+        schedule=payload.schedule,
+        agent_id=payload.agent_id,
+        task=payload.task,
+        task_params=payload.task_params,
+        timezone=payload.timezone,
+        run_immediately=payload.run_immediately,
+        user_id=(principal_id if internal_key else payload.user_id),
+        tags=payload.tags,
+    )
+
+    manager = get_trigger_manager()
+    trigger_id = await manager.add_trigger(trigger)
+
+    return {
+        "success": True,
+        "trigger_id": trigger_id,
+        "trigger": trigger.to_dict(),
+    }
+
+
+@app.post("/api/triggers/webhook")
+async def create_webhook_trigger(request: Request, payload: CreateWebhookTriggerRequest):
+    """Create a new webhook trigger."""
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+    trigger = WebhookTrigger(
+        name=payload.name,
+        description=payload.description,
+        agent_id=payload.agent_id,
+        task=payload.task,
+        task_params=payload.task_params,
+        http_methods=payload.http_methods,
+        require_auth=payload.require_auth,
+        rate_limit=payload.rate_limit,
+        user_id=(principal_id if internal_key else payload.user_id),
+        tags=payload.tags,
+    )
+
+    # Generate auth token if authentication is required
+    if trigger.require_auth:
+        from triggers.webhook import get_webhook_handler
+
+        trigger.auth_token = get_webhook_handler().generate_auth_token()
+
+    manager = get_trigger_manager()
+    trigger_id = await manager.add_trigger(trigger)
+
+    response = {
+        "success": True,
+        "trigger_id": trigger_id,
+        "trigger": trigger.to_dict(),
+        "endpoint": trigger.endpoint_path,
+    }
+
+    if trigger.require_auth:
+        response["auth_token"] = trigger.auth_token
+
+    return response
+
+
+@app.post("/api/triggers/event")
+async def create_event_trigger(request: Request, payload: CreateEventTriggerRequest):
+    """Create a new event trigger."""
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+    trigger = EventTrigger(
+        name=payload.name,
+        description=payload.description,
+        event_type=payload.event_type,
+        event_source=payload.event_source,
+        event_filters=payload.event_filters,
+        agent_id=payload.agent_id,
+        task=payload.task,
+        task_params=payload.task_params,
+        debounce_seconds=payload.debounce_seconds,
+        user_id=(principal_id if internal_key else payload.user_id),
+        tags=payload.tags,
+    )
+
+    manager = get_trigger_manager()
+    trigger_id = await manager.add_trigger(trigger)
+
+    return {
+        "success": True,
+        "trigger_id": trigger_id,
+        "trigger": trigger.to_dict(),
+    }
+
+
+@app.get("/api/triggers")
+async def list_triggers(
+    request: Request,
+    trigger_type: Optional[str] = None,
+    status: Optional[str] = None,
+    user_id: Optional[str] = None,
+):
+    """List all triggers with optional filtering."""
+    manager = get_trigger_manager()
+
+    type_filter = TriggerType(trigger_type) if trigger_type else None
+    status_filter = TriggerStatus(status) if status else None
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    if internal_key:
+        principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+        user_id = principal_id or user_id
+
+    triggers = manager.list_triggers(
+        trigger_type=type_filter,
+        status=status_filter,
+        user_id=user_id,
+    )
+
+    return {
+        "triggers": [t.to_dict() for t in triggers],
+        "total": len(triggers),
+    }
+
+
+@app.get("/api/triggers/{trigger_id}")
+async def get_trigger(trigger_id: str, request: Request):
+    """Get a specific trigger by ID."""
+    manager = get_trigger_manager()
+    trigger = manager.get_trigger(trigger_id)
+
+    if not trigger:
+        raise HTTPException(status_code=404, detail="Trigger not found")
+
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    if internal_key:
+        principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+        if trigger.user_id and trigger.user_id != principal_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+    return {"trigger": trigger.to_dict()}
+
+
+@app.delete("/api/triggers/{trigger_id}")
+async def delete_trigger(trigger_id: str, request: Request):
+    """Delete a trigger."""
+    manager = get_trigger_manager()
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    if internal_key:
+        principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+        trigger = manager.get_trigger(trigger_id)
+        if trigger and trigger.user_id and trigger.user_id != principal_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    success = await manager.remove_trigger(trigger_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Trigger not found")
+
+    return {"success": True, "message": "Trigger deleted"}
+
+
+@app.post("/api/triggers/{trigger_id}/pause")
+async def pause_trigger(trigger_id: str, request: Request):
+    """Pause a trigger."""
+    manager = get_trigger_manager()
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    if internal_key:
+        principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+        trigger = manager.get_trigger(trigger_id)
+        if trigger and trigger.user_id and trigger.user_id != principal_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    success = await manager.pause_trigger(trigger_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Trigger not found")
+
+    return {"success": True, "message": "Trigger paused"}
+
+
+@app.post("/api/triggers/{trigger_id}/resume")
+async def resume_trigger(trigger_id: str, request: Request):
+    """Resume a paused trigger."""
+    manager = get_trigger_manager()
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    if internal_key:
+        principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+        trigger = manager.get_trigger(trigger_id)
+        if trigger and trigger.user_id and trigger.user_id != principal_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    success = await manager.resume_trigger(trigger_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Trigger not found or not paused")
+
+    return {"success": True, "message": "Trigger resumed"}
+
+
+@app.get("/api/triggers/{trigger_id}/executions")
+async def get_trigger_executions(trigger_id: str, request: Request, limit: int = 50):
+    """Get execution history for a trigger."""
+    manager = get_trigger_manager()
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+    if internal_key:
+        principal_id = (getattr(request.state, "principal_id", "") or "").strip()
+        trigger = manager.get_trigger(trigger_id)
+        if trigger and trigger.user_id and trigger.user_id != principal_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    executions = manager.get_executions(trigger_id=trigger_id, limit=limit)
+
+    return {
+        "executions": [e.to_dict() for e in executions],
+        "total": len(executions),
+    }
+
+
+@app.post("/api/webhook/{trigger_id}")
+async def handle_webhook(
+    trigger_id: str,
+    request: Request,
+):
+    """Handle incoming webhook requests."""
+    manager = get_trigger_manager()
+    internal_key = (getattr(settings, "internal_api_key", "") or "").strip()
+
+    # Extract request data
+    body = None
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+
+    query_params = dict(request.query_params)
+    headers = dict(request.headers)
+    auth_header = request.headers.get("Authorization")
+
+    if internal_key:
+        provided = ""
+        if isinstance(auth_header, str) and auth_header.strip().lower().startswith("bearer "):
+            provided = auth_header.strip()[7:].strip()
+        if not provided:
+            provided = (request.headers.get("X-API-Key") or "").strip()
+
+        internal_ok = bool(provided) and hmac.compare_digest(provided, internal_key)
+        if not internal_ok:
+            trigger = manager.get_trigger(trigger_id)
+            require_auth = bool(getattr(trigger, "require_auth", False)) if trigger else False
+            if trigger and not require_auth:
+                raise HTTPException(status_code=401, detail="Unauthorized")
+
+    result = await manager.handle_webhook(
+        trigger_id=trigger_id,
+        method=request.method,
+        body=body,
+        query_params=query_params,
+        headers=headers,
+        auth_header=auth_header,
+    )
+
+    status_code = result.pop("status_code", 200)
+
+    if not result.get("success"):
+        raise HTTPException(status_code=status_code, detail=result.get("error"))
+
+    return result
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # `settings` reads from `.env` (see `common/config.py`). This makes the
+    # backend port configurable via `PORT=...` in `.env`, not only via shell env.
+    port = int(getattr(settings, "port", 8001) or 8001)
+
+    # NOTE: `uvicorn` hot reload (watchfiles) watches the whole CWD tree.
+    # In this repo we have `web/node_modules`, which easily exceeds OS watcher limits
+    # and crashes reload with "OS file watch limit reached".
+    #
+    # Keep reload opt-in to make `python main.py` reliable out-of-the-box.
+    reload_enabled = bool(settings.debug) and bool(getattr(settings, "weaver_reload", False))
+    if settings.debug and not reload_enabled:
+        logger.info("Hot reload disabled (set WEAVER_RELOAD=true to enable).")
+
+    reload_dirs = None
+    reload_excludes = None
+    if reload_enabled:
+        try:
+            from common.uvicorn_reload import get_uvicorn_reload_dirs, get_uvicorn_reload_excludes
+
+            reload_dirs = get_uvicorn_reload_dirs()
+            reload_excludes = get_uvicorn_reload_excludes()
+        except Exception:
+            reload_dirs = None
+            reload_excludes = None
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=reload_enabled,
+        reload_dirs=reload_dirs,
+        reload_excludes=reload_excludes,
+        log_level="info",
+    )
